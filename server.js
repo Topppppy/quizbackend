@@ -9,7 +9,10 @@ const jwt      = require('jsonwebtoken');
 const { QUESTIONS_DB } = require('./questions');
 const { BIBLE_QUESTIONS } = require('./bibleQuestions');
 const User     = require('./models/User');
-const Admin    = require('./models/Admin');
+
+// ─── Hardcoded admin credentials ─────────────────────────────────────────────
+const ADMIN_EMAIL    = 'indtropical@gmail.com';
+const ADMIN_PASSWORD = 'Olatun@900';
 
 const app    = express();
 const server = http.createServer(app);
@@ -897,35 +900,24 @@ app.get('/api/users/:deviceId', async (req, res) => {
 });
 
 // ─── Admin login ──────────────────────────────────────────────────────────────
-app.post('/admin/login', async (req, res) => {
-  try {
-    const { email, password } = req.body;
+app.post('/admin/login', (req, res) => {
+  const { email, password } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'email and password are required' });
-    }
-
-    const admin = await Admin.findOne({ email });
-    if (!admin) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const isMatch = await admin.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign(
-      { adminId: admin._id, email: admin.email },
-      process.env.JWT_SECRET,
-      { expiresIn: '24h' }
-    );
-
-    res.json({ ok: true, token, admin: { id: admin._id, email: admin.email } });
-  } catch (err) {
-    console.error('[admin/login] Error:', err.message);
-    res.status(500).json({ error: 'Server error' });
+  if (!email || !password) {
+    return res.status(400).json({ error: 'email and password are required' });
   }
+
+  if (email !== ADMIN_EMAIL || password !== ADMIN_PASSWORD) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  const token = jwt.sign(
+    { email },
+    process.env.JWT_SECRET,
+    { expiresIn: '24h' }
+  );
+
+  res.json({ ok: true, token, admin: { email } });
 });
 
 // ─── Admin auth middleware ────────────────────────────────────────────────────
