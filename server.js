@@ -1,10 +1,15 @@
+require('dotenv').config();
 const express  = require('express');
 const http     = require('http');
 const { Server } = require('socket.io');
 const cors     = require('cors');
 const crypto   = require('crypto');
+const mongoose = require('mongoose');
+const jwt      = require('jsonwebtoken');
 const { QUESTIONS_DB } = require('./questions');
 const { BIBLE_QUESTIONS } = require('./bibleQuestions');
+const User     = require('./models/User');
+const Admin    = require('./models/Admin');
 
 const app    = express();
 const server = http.createServer(app);
@@ -845,6 +850,97 @@ function evaluateRound(match, io) {
     // Reset answers for next question
     p1.answer = null; p1.answerTime = null;
     p2.answer = null; p2.answerTime = null;
+  }
+}
+
+// ─── MongoDB connection ───────────────────────────────────────────────────────
+mongoose
+  .connect(process.env.MONGO_URI)
+  .then(() => console.log('✅ Connected to MongoDB'))
+  .catch((err) => console.error('❌ MongoDB connection error:', err));
+
+// ─── User registration (save username + deviceId) ─────────────────────────────
+app.post('/api/users', async (req, res) => {
+  try {
+    const { username, deviceId } = req.body;
+
+    if (!username || !deviceId) {
+      return res.status(400).json({ error: 'username and deviceId are required' });
+    }
+    if (typeof username !== 'string' || username.length > 30) {
+      return res.status(400).json({ error: 'Invalid username (max 30 chars)' });
+    }
+
+    // Upsert: update username if deviceId already exists, otherwise create
+    const user = await User.findOneAndUpdate(
+      { deviceId },
+      { username, deviceId },
+      { upsert: true, new: true, runValidators: true }
+    );
+
+    res.status(201).json({ ok: true, user });
+  } catch (err) {
+    console.error('[api/users] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get user by deviceId
+app.get('/api/users/:deviceId', async (req, res) => {
+  try {
+    const user = await User.findOne({ deviceId: req.params.deviceId });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── Admin login ──────────────────────────────────────────────────────────────
+app.post('/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'email and password are required' });
+    }
+
+    const admin = await Admin.findOne({ email });
+    if (!admin) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const isMatch = await admin.comparePassword(password);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { adminId: admin._id, email: admin.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({ ok: true, token, admin: { id: admin._id, email: admin.email } });
+  } catch (err) {
+    console.error('[admin/login] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─── Admin auth middleware ────────────────────────────────────────────────────
+function requireAdmin(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  try {
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.admin = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token' });
   }
 }
 
