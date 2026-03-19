@@ -1167,6 +1167,40 @@ app.get('/tournament/status', (_, res) => {
   });
 });
 
+// Get scheduled date and check if it's time to start (public)
+app.get('/tournament/schedule', (_, res) => {
+  const scheduledDate = tournamentConfig.scheduledDate;
+  
+  if (!scheduledDate) {
+    return res.json({
+      ok: true,
+      scheduled: false,
+      scheduledDate: null,
+      timeUntilStart: null,
+      isTimeToStart: false,
+      tournamentStarted: tournamentConfig.tournamentStarted,
+    });
+  }
+
+  const now = Date.now();
+  const startTime = new Date(scheduledDate).getTime();
+  const timeUntilStart = startTime - now; // milliseconds until start (negative if past)
+  const isTimeToStart = timeUntilStart <= 0;
+
+  res.json({
+    ok: true,
+    scheduled: true,
+    scheduledDate,
+    scheduledDateFormatted: new Date(scheduledDate).toLocaleString(),
+    timeUntilStart,                          // ms until start (negative = already past)
+    timeUntilStartSeconds: Math.floor(timeUntilStart / 1000),
+    isTimeToStart,                           // true when now >= scheduledDate
+    tournamentStarted: tournamentConfig.tournamentStarted,
+    registrationOpen: isRegistrationMode(),
+    registeredCount: registeredPlayers.size,
+  });
+});
+
 // Admin: Set the bible quiz date & time — opens registration
 // Protected: requires admin JWT
 // Body: { date: '2026-03-20', time: '18:00' }  OR  { scheduledDate: '<ISO string>' }
