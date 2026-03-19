@@ -11,7 +11,7 @@ const tournamentPlayerSchema = new mongoose.Schema(
     deviceId: {
       type: String,
       required: true,
-      unique: true,
+      // Note: unique constraint is now a compound index with tournamentId (see below)
     },
     // Which tournament session they belong to (ISO date string of scheduledDate)
     tournamentId: {
@@ -35,5 +35,8 @@ const tournamentPlayerSchema = new mongoose.Schema(
   },
   { timestamps: true }
 );
+
+// Compound unique index: same device can join different tournaments, but only once per tournament
+tournamentPlayerSchema.index({ deviceId: 1, tournamentId: 1 }, { unique: true });
 
 module.exports = mongoose.model('TournamentPlayer', tournamentPlayerSchema);
