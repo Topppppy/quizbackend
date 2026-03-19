@@ -8,7 +8,8 @@ const mongoose = require('mongoose');
 const jwt      = require('jsonwebtoken');
 const { QUESTIONS_DB } = require('./questions');
 const { BIBLE_QUESTIONS } = require('./bibleQuestions');
-const User     = require('./models/User');
+const User              = require('./models/User');
+const TournamentPlayer  = require('./models/TournamentPlayer');
 
 // ─── Hardcoded admin credentials ─────────────────────────────────────────────
 const ADMIN_EMAIL    = 'indtropical@gmail.com';
@@ -62,6 +63,11 @@ let tournamentConfig = {
   tournamentStarted: false,       // Has the admin started the tournament?
 };
 
+// Elimination bracket: tracks winners waiting for next round pairing
+// round → [ { deviceId, username, socketId, wins } ]
+const bracketWinners = new Map();
+let currentRound = 1;
+
 // Registration mode is ON only when admin has set a scheduled date
 function isRegistrationMode() {
   return tournamentConfig.scheduledDate !== null && !tournamentConfig.tournamentStarted;
@@ -74,21 +80,23 @@ function canStartPlaying() {
 // Auto-start timer reference
 let autoStartTimer = null;
 
-// Reusable function to start the tournament and pair all players
-function startTournament() {
-  if (tournamentConfig.tournamentStarted) return { error: 'Tournament already started' };
-  if (registeredPlayers.size < 2) return { error: 'Need at least 2 registered players' };
+// ─── Elimination bracket helpers ─────────────────────────────────────────────
 
-  tournamentConfig.tournamentStarted = true;
-
-  // Shuffle registered players and pair them into 1v1 Bible quiz matches
-  const players = [...registeredPlayers.values()];
-  for (let i = players.length - 1; i > 0; i--) {
+// Shuffle array in-place (Fisher-Yates)
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
     const j = Math.floor(Math.random() * (i + 1));
-    [players[i], players[j]] = [players[j], players[i]];
+    [arr[i], arr[j]] = [arr[j], arr[i]];
   }
+  return arr;
+}
 
+// Pair a list of players into Bible quiz matches for the current round.
+// Returns the list of match descriptors created.
+function pairPlayersForRound(players, round) {
+  shuffleArray(players);
   const matchPairs = [];
+
   for (let i = 0; i < players.length - 1; i += 2) {
     const p1 = players[i];
     const p2 = players[i + 1];
@@ -96,63 +104,127 @@ function startTournament() {
     const match = createMatch(
       { deviceId: p1.deviceId, username: p1.username, socketId: p1.socketId },
       { deviceId: p2.deviceId, username: p2.username, socketId: p2.socketId },
-      true // isSpecialSession = Bible quiz
+      true // always Bible quiz for tournament
     );
+    // Tag the match with round info so evaluateRound can trigger next-round logic
+    match.tournamentRound = round;
 
     matchPairs.push({
       matchId: match.matchId,
+      round,
       p1: { username: p1.username, deviceId: p1.deviceId },
       p2: { username: p2.username, deviceId: p2.deviceId },
     });
 
     const s1 = io.sockets.sockets.get(p1.socketId);
     const s2 = io.sockets.sockets.get(p2.socketId);
+    const matchPayload = { matchId: match.matchId, matchSeed: match.seed, questions: match.questions, round };
 
-    const matchPayload = {
-      matchId: match.matchId,
-      matchSeed: match.seed,
-      questions: match.questions,
-    };
+    if (s1) { s1.join(match.matchId); s1.emit('match_found', { ...matchPayload, opponent: { username: p2.username, id: p2.deviceId } }); }
+    if (s2) { s2.join(match.matchId); s2.emit('match_found', { ...matchPayload, opponent: { username: p1.username, id: p1.deviceId } }); }
 
-    if (s1) {
-      s1.join(match.matchId);
-      s1.emit('match_found', {
-        ...matchPayload,
-        opponent: { username: p2.username, id: p2.deviceId },
-      });
-    }
-    if (s2) {
-      s2.join(match.matchId);
-      s2.emit('match_found', {
-        ...matchPayload,
-        opponent: { username: p1.username, id: p1.deviceId },
-      });
-    }
-
-    console.log(`[tournament] Paired: ${p1.username} vs ${p2.username} → ${match.matchId}`);
+    console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId}`);
   }
 
-  // Handle odd player — give them a bye
+  // Odd player out → automatic bye (advances to next round)
   if (players.length % 2 !== 0) {
     const byePlayer = players[players.length - 1];
     const s = io.sockets.sockets.get(byePlayer.socketId);
-    if (s) {
-      s.emit('tournament_bye', {
-        message: 'You got a bye this round! You advance automatically.',
-        username: byePlayer.username,
-      });
-    }
-    console.log(`[tournament] Bye: ${byePlayer.username} (odd player count)`);
+    if (s) s.emit('tournament_bye', { message: 'You got a bye this round! You advance automatically.', username: byePlayer.username, round });
+
+    // Immediately queue bye player as a winner for the next round
+    queueWinnerForNextRound(byePlayer, round);
+    console.log(`[tournament R${round}] Bye: ${byePlayer.username}`);
   }
+
+  broadcastToSpectators('round_started', { round, matchCount: matchPairs.length });
+  io.emit('tournament_round_started', { round, matchCount: matchPairs.length, playerCount: players.length });
+  return matchPairs;
+}
+
+// Called after a match ends: queue winner into next round bracket
+function queueWinnerForNextRound(player, round) {
+  if (!bracketWinners.has(round)) bracketWinners.set(round, []);
+  bracketWinners.get(round).push(player);
+
+  const waitingWinners = bracketWinners.get(round);
+  console.log(`[bracket R${round}] ${player.username} queued (${waitingWinners.length} waiting)`);
+
+  // Check if we have enough winners to start next round (≥2) and no active matches remain for this round
+  const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
+  if (activeRoundMatches.length === 0 && waitingWinners.length >= 2) {
+    advanceToNextRound(round);
+  } else if (activeRoundMatches.length === 0 && waitingWinners.length === 1) {
+    // Only one player left in the whole tournament — they are the champion!
+    const champion = waitingWinners[0];
+    declareTournamentChampion(champion);
+  }
+}
+
+// Advance all waiting winners into the next round
+function advanceToNextRound(completedRound) {
+  const nextRound = completedRound + 1;
+  currentRound = nextRound;
+
+  const advancingPlayers = bracketWinners.get(completedRound) || [];
+  bracketWinners.delete(completedRound);
+
+  console.log(`[tournament] Round ${completedRound} complete — ${advancingPlayers.length} players advance to Round ${nextRound}`);
+
+  if (advancingPlayers.length === 1) {
+    declareTournamentChampion(advancingPlayers[0]);
+    return;
+  }
+
+  io.emit('tournament_next_round', { round: nextRound, playerCount: advancingPlayers.length });
+  pairPlayersForRound(advancingPlayers, nextRound);
+}
+
+// Declare the overall tournament champion
+async function declareTournamentChampion(player) {
+  console.log(`[tournament] 🏆 CHAMPION: ${player.username}`);
+  io.emit('tournament_champion', { username: player.username, deviceId: player.deviceId });
+  broadcastToSpectators('tournament_champion', { username: player.username });
+
+  const s = io.sockets.sockets.get(player.socketId);
+  if (s) s.emit('you_are_champion', { message: '🏆 Congratulations! You are the Tournament Champion!' });
+
+  // Update leaderboard
+  const lb = leaderboard.get(player.username) || { username: player.username, wins: 0 };
+  lb.stage = 'champion';
+  leaderboard.set(player.username, lb);
+  broadcastLeaderboard();
+
+  // Persist champion status to MongoDB
+  try {
+    await TournamentPlayer.findOneAndUpdate(
+      { deviceId: player.deviceId, tournamentId: tournamentConfig.scheduledDate },
+      { status: 'winner' }
+    );
+  } catch (e) { console.error('[tournament] DB update champion error:', e.message); }
+}
+
+// Reusable function to start the tournament and pair all players (Round 1)
+function startTournament() {
+  if (tournamentConfig.tournamentStarted) return { error: 'Tournament already started' };
+  if (registeredPlayers.size < 2) return { error: 'Need at least 2 registered players' };
+
+  tournamentConfig.tournamentStarted = true;
+  currentRound = 1;
+  bracketWinners.clear();
+
+  const players = [...registeredPlayers.values()];
+  const matchPairs = pairPlayersForRound(players, 1);
 
   io.emit('tournament_started', {
     message: 'Tournament is starting!',
     playerCount: registeredPlayers.size,
     matchCount: matchPairs.length,
+    round: 1,
   });
 
-  console.log(`[tournament] Started with ${registeredPlayers.size} players, ${matchPairs.length} matches`);
-  return { ok: true, playerCount: registeredPlayers.size, matches: matchPairs };
+  console.log(`[tournament] Started with ${registeredPlayers.size} players, ${matchPairs.length} Round-1 matches`);
+  return { ok: true, playerCount: registeredPlayers.size, matches: matchPairs, round: 1 };
 }
 
 // Schedule auto-start timer for a tournament
@@ -526,12 +598,28 @@ io.on('connection', (socket) => {
 
     // Tournament mode: only active when admin has set a scheduled date
     if (isRegistrationMode()) {
-      // Registration is open — add player to waiting list
+      // If player already registered via REST, just update their socketId
+      if (registeredPlayers.has(deviceId)) {
+        const rp = registeredPlayers.get(deviceId);
+        rp.socketId = socket.id;
+        socket.emit('tournament_waiting', {
+          message: 'You are registered! Waiting for tournament to start...',
+          waitingCount: registeredPlayers.size,
+          scheduledDate: tournamentConfig.scheduledDate,
+        });
+        console.log(`[tournament] ${username} reconnected socket (${registeredPlayers.size} waiting)`);
+        return;
+      }
+
+      // Otherwise register them now (fallback for socket-only clients)
       registeredPlayers.set(deviceId, {
         username,
         deviceId,
         joinedAt: Date.now(),
         socketId: socket.id,
+        wins: 0,
+        round: 1,
+        status: 'waiting',
       });
       
       // Add to leaderboard as "waiting"
@@ -830,7 +918,6 @@ function evaluateRound(match, io) {
     if (winner) {
       const wb = leaderboard.get(winner.username) || { username: winner.username, wins: 0, totalTime: 0 };
       wb.wins = (wb.wins || 0) + 1;
-      // totalTime: sum of answerTimes for this match winner
       const winnerAnswerTime = winner.answerTime || 0;
       wb.totalTime = (wb.totalTime || 0) + winnerAnswerTime;
       leaderboard.set(winner.username, wb);
@@ -849,6 +936,58 @@ function evaluateRound(match, io) {
 
     match.active = false;
     setTimeout(() => matches.delete(match.matchId), 120000); // clean up after 2min
+
+    // ── Tournament elimination bracket logic ────────────────────────────
+    if (match.tournamentRound) {
+      const round = match.tournamentRound;
+
+      // Evict loser from tournament
+      if (loser) {
+        const lp = registeredPlayers.get(loser.deviceId);
+        if (lp) lp.status = 'eliminated';
+        TournamentPlayer.findOneAndUpdate(
+          { deviceId: loser.deviceId, tournamentId: tournamentConfig.scheduledDate },
+          { status: 'eliminated' }
+        ).catch(e => console.error('[bracket] DB evict error:', e.message));
+
+        const loserSocket = io.sockets.sockets.get(loser.socketId);
+        if (loserSocket) loserSocket.emit('tournament_eliminated', {
+          message: 'You have been eliminated from the tournament.',
+          round,
+        });
+        console.log(`[tournament R${round}] Eliminated: ${loser.username}`);
+      }
+
+      // Queue winner for the next round (both-wrong = no one advances, both eliminated)
+      if (winner) {
+        const wp = registeredPlayers.get(winner.deviceId);
+        if (wp) {
+          wp.wins = (wp.wins || 0) + 1;
+          wp.round = round + 1;
+          wp.status = 'waiting';
+        }
+        TournamentPlayer.findOneAndUpdate(
+          { deviceId: winner.deviceId, tournamentId: tournamentConfig.scheduledDate },
+          { $inc: { wins: 1 }, round: round + 1 }
+        ).catch(e => console.error('[bracket] DB winner update error:', e.message));
+
+        queueWinnerForNextRound(
+          { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
+          round
+        );
+      } else {
+        // Both wrong — both eliminated, check if round is now complete
+        const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
+        const waitingWinners = bracketWinners.get(round) || [];
+        if (activeRoundMatches.length === 0) {
+          if (waitingWinners.length >= 2) advanceToNextRound(round);
+          else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
+          else {
+            io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion this round.' });
+          }
+        }
+      }
+    }
   } else {
     // Reset answers for next question
     p1.answer = null; p1.answerTime = null;
@@ -862,7 +1001,9 @@ mongoose
   .then(() => console.log('✅ Connected to MongoDB'))
   .catch((err) => console.error('❌ MongoDB connection error:', err));
 
-// ─── User registration (save username + deviceId) ─────────────────────────────
+// ─── Tournament player registration (save username + deviceId to MongoDB) ──────
+// Called from the frontend when a user wants to join the tournament.
+// Also saves to the persistent User collection for general user tracking.
 app.post('/api/users', async (req, res) => {
   try {
     const { username, deviceId } = req.body;
@@ -874,14 +1015,55 @@ app.post('/api/users', async (req, res) => {
       return res.status(400).json({ error: 'Invalid username (max 30 chars)' });
     }
 
-    // Upsert: update username if deviceId already exists, otherwise create
-    const user = await User.findOneAndUpdate(
+    // Always upsert into general User collection
+    await User.findOneAndUpdate(
       { deviceId },
       { username, deviceId },
       { upsert: true, new: true, runValidators: true }
     );
 
-    res.status(201).json({ ok: true, user });
+    // If registration is open, also register into current tournament
+    if (isRegistrationMode()) {
+      if (registeredPlayers.has(deviceId)) {
+        return res.status(409).json({ error: 'Already registered for this tournament' });
+      }
+
+      // Save to MongoDB tournament players collection
+      await TournamentPlayer.findOneAndUpdate(
+        { deviceId, tournamentId: tournamentConfig.scheduledDate },
+        { username, deviceId, tournamentId: tournamentConfig.scheduledDate, status: 'waiting', wins: 0, round: 1 },
+        { upsert: true, new: true, runValidators: true }
+      );
+
+      // Register in-memory
+      registeredPlayers.set(deviceId, {
+        username,
+        deviceId,
+        joinedAt: Date.now(),
+        socketId: null, // will be set when socket connects
+        wins: 0,
+        round: 1,
+        status: 'waiting',
+      });
+
+      if (!leaderboard.has(username)) {
+        leaderboard.set(username, { username, wins: 0, stage: 'waiting' });
+      }
+
+      broadcastToSpectators('player_joined', { username, waitingCount: registeredPlayers.size });
+      io.emit('waiting_count', { count: registeredPlayers.size });
+
+      console.log(`[tournament] ${username} registered via REST (${registeredPlayers.size} total)`);
+      return res.status(201).json({
+        ok: true,
+        registered: true,
+        waitingCount: registeredPlayers.size,
+        scheduledDate: tournamentConfig.scheduledDate,
+        message: 'Registered! Waiting for tournament to start.',
+      });
+    }
+
+    res.status(201).json({ ok: true, registered: false, message: 'User saved. No active tournament registration.' });
   } catch (err) {
     console.error('[api/users] Error:', err.message);
     res.status(500).json({ error: 'Server error' });
@@ -895,6 +1077,18 @@ app.get('/api/users/:deviceId', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json(user);
   } catch (err) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get all players
+app.get('/api/users', async (req, res) => {
+  try {
+    const users = await User.find({}, { username: 1, deviceId: 1, createdAt: 1, _id: 0 })
+      .sort({ createdAt: -1 });
+    res.json({ ok: true, count: users.length, users });
+  } catch (err) {
+    console.error('[api/users] GET all error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
 });
@@ -960,26 +1154,59 @@ app.get('/tournament/status', (_, res) => {
   });
 });
 
-// Admin: Schedule a tournament (sets date → opens registration)
-app.post('/admin/tournament/schedule', (req, res) => {
+// Admin: Set the bible quiz date & time — opens registration
+// Protected: requires admin JWT
+// Body: { date: '2026-03-20', time: '18:00' }  OR  { scheduledDate: '<ISO string>' }
+app.post('/admin/tournament/set-schedule', requireAdmin, (req, res) => {
+  const { date, time, scheduledDate: isoOverride } = req.body;
+
+  let scheduledDate = isoOverride || null;
+
+  if (!scheduledDate) {
+    if (!date || !time) {
+      return res.status(400).json({ error: 'Provide either { date, time } or { scheduledDate } (ISO string)' });
+    }
+    // Combine date (YYYY-MM-DD) + time (HH:MM) into a full ISO string
+    scheduledDate = new Date(`${date}T${time}:00`).toISOString();
+  }
+
+  if (isNaN(new Date(scheduledDate).getTime())) {
+    return res.status(400).json({ error: 'Invalid date/time value' });
+  }
+
+  tournamentConfig.scheduledDate = scheduledDate;
+  tournamentConfig.tournamentStarted = false;
+  registeredPlayers.clear();
+  bracketWinners.clear();
+  currentRound = 1;
+
+  scheduleAutoStart(scheduledDate);
+
+  io.emit('tournament_config_updated', {
+    scheduledDate,
+    registrationOpen: true,
+    tournamentStarted: false,
+  });
+
+  console.log(`[tournament] Bible quiz scheduled for ${scheduledDate} — registration open`);
+  res.json({ ok: true, scheduledDate, message: 'Bible quiz scheduled! Registration is now open.' });
+});
+
+// Admin: Schedule a tournament (legacy alias — kept for backward compat)
+app.post('/admin/tournament/schedule', requireAdmin, (req, res) => {
   const { scheduledDate } = req.body;
   if (!scheduledDate) {
     return res.status(400).json({ error: 'scheduledDate is required (ISO string)' });
   }
-  
+  req.body.scheduledDate = scheduledDate;
+  // Delegate to set-schedule logic
   tournamentConfig.scheduledDate = scheduledDate;
   tournamentConfig.tournamentStarted = false;
   registeredPlayers.clear();
-  
-  // Schedule auto-start timer
+  bracketWinners.clear();
+  currentRound = 1;
   scheduleAutoStart(scheduledDate);
-  
-  io.emit('tournament_config_updated', {
-    scheduledDate: tournamentConfig.scheduledDate,
-    registrationOpen: true,
-    tournamentStarted: false,
-  });
-  
+  io.emit('tournament_config_updated', { scheduledDate, registrationOpen: true, tournamentStarted: false });
   console.log(`[tournament] Scheduled for ${scheduledDate} — registration open`);
   res.json({ ok: true, scheduledDate, message: 'Registration is now open!' });
 });
