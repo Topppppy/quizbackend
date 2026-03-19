@@ -1094,6 +1094,17 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// Get total number of registered players
+app.get('/api/users/count', async (req, res) => {
+  try {
+    const count = await User.countDocuments();
+    res.json({ ok: true, count });
+  } catch (err) {
+    console.error('[api/users/count] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // ─── Admin login ──────────────────────────────────────────────────────────────
 app.post('/admin/login', (req, res) => {
   const { email, password } = req.body;
