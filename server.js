@@ -1344,6 +1344,21 @@ app.get('/api/users/count', async (req, res) => {
   }
 });
 
+// Get user by username (for frontend validation of cached users)
+// NOTE: This must come BEFORE /api/users/:deviceId to avoid "username" being treated as a deviceId
+app.get('/api/users/username/:username', async (req, res) => {
+  try {
+    // Normalize username to lowercase for case-insensitive lookup
+    const username = String(req.params.username).trim().toLowerCase();
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({ ok: true, user: { username: user.username, deviceId: user.deviceId, createdAt: user.createdAt } });
+  } catch (err) {
+    console.error('[api/users/username] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 // Get user by deviceId
 app.get('/api/users/:deviceId', async (req, res) => {
   try {
