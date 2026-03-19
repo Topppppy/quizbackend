@@ -706,32 +706,82 @@ io.on('connection', (socket) => {
       }
 
       // Otherwise register them now (fallback for socket-only clients)
-      registeredPlayers.set(deviceId, {
-        username,
-        deviceId,
-        joinedAt: Date.now(),
-        socketId: socket.id,
-        wins: 0,
-        round: 1,
-        status: 'waiting',
-      });
+      // First, persist to database (User + TournamentPlayer)
+      (async () => {
+        try {
+          // Check if user already exists in DB by deviceId
+          let existingUser = await User.findOne({ deviceId });
+          
+          if (!existingUser) {
+            // Normalize username
+            const normalizedUsername = String(username).trim().toLowerCase();
+            
+            // Check if username is already taken
+            const usernameTaken = await User.findOne({ username: normalizedUsername });
+            if (usernameTaken) {
+              socket.emit('registration_error', { 
+                error: 'Username is already taken. Please choose another.',
+                code: 'USERNAME_TAKEN'
+              });
+              console.log(`[tournament] ${username} rejected — username taken`);
+              return;
+            }
+            
+            // Create user in DB
+            existingUser = await User.create({ username: normalizedUsername, deviceId });
+            console.log(`[tournament] ${normalizedUsername} saved to User collection`);
+          }
+
+          // Save to TournamentPlayer collection
+          await TournamentPlayer.findOneAndUpdate(
+            { deviceId, tournamentId: tournamentConfig.scheduledDate },
+            { 
+              username: existingUser.username, 
+              deviceId, 
+              tournamentId: tournamentConfig.scheduledDate, 
+              status: 'waiting', 
+              wins: 0, 
+              round: 1 
+            },
+            { upsert: true }
+          );
+
+          // Register in-memory
+          registeredPlayers.set(deviceId, {
+            username: existingUser.username,
+            deviceId,
+            joinedAt: Date.now(),
+            socketId: socket.id,
+            wins: 0,
+            round: 1,
+            status: 'waiting',
+          });
+          
+          // Add to leaderboard as "waiting"
+          if (!leaderboard.has(existingUser.username)) {
+            leaderboard.set(existingUser.username, { username: existingUser.username, wins: 0, stage: 'waiting' });
+          }
+          
+          socket.emit('tournament_waiting', {
+            message: 'You are registered! Waiting for tournament to start...',
+            waitingCount: registeredPlayers.size,
+            scheduledDate: tournamentConfig.scheduledDate,
+          });
+          
+          // Broadcast to spectators
+          broadcastToSpectators('player_joined', { username: existingUser.username, waitingCount: registeredPlayers.size });
+          io.emit('waiting_count', { count: registeredPlayers.size });
+          
+          console.log(`[tournament] ${existingUser.username} registered via socket + saved to DB (${registeredPlayers.size} waiting)`);
+        } catch (err) {
+          console.error(`[tournament] DB error registering ${username}:`, err.message);
+          socket.emit('registration_error', { 
+            error: 'Registration failed. Please try again.',
+            code: 'DB_ERROR'
+          });
+        }
+      })();
       
-      // Add to leaderboard as "waiting"
-      if (!leaderboard.has(username)) {
-        leaderboard.set(username, { username, wins: 0, stage: 'waiting' });
-      }
-      
-      socket.emit('tournament_waiting', {
-        message: 'You are registered! Waiting for tournament to start...',
-        waitingCount: registeredPlayers.size,
-        scheduledDate: tournamentConfig.scheduledDate,
-      });
-      
-      // Broadcast to spectators
-      broadcastToSpectators('player_joined', { username, waitingCount: registeredPlayers.size });
-      io.emit('waiting_count', { count: registeredPlayers.size });
-      
-      console.log(`[tournament] ${username} registered (${registeredPlayers.size} waiting)`);
       return;
     }
 
@@ -978,12 +1028,17 @@ function evaluateRound(match, io) {
       match.questionIndex++;
       match.questionStartTime = Date.now();
       
+      // Reset answers BEFORE sending next question
+      p1.answer = null; p1.answerTime = null;
+      p2.answer = null; p2.answerTime = null;
+      
       // Send the next question to both players
       const nextQuestion = match.questions[match.questionIndex];
       const nextQuestionPayload = {
         questionIndex: match.questionIndex,
         question: nextQuestion,
         bothCorrectCount: match.bothCorrectCount,
+        totalQuestions: match.questions.length,
         message: 'Both correct! Here\'s another question.',
       };
       
@@ -991,6 +1046,17 @@ function evaluateRound(match, io) {
         const sock = io.sockets.sockets.get(player.socketId);
         if (sock) sock.emit('next_question', nextQuestionPayload);
       });
+      
+      // Don't emit round_result for both_correct — next_question is sufficient
+      // Just broadcast to spectators and return early
+      broadcastToSpectators('both_correct', {
+        matchId: match.matchId,
+        p1: p1.username,
+        p2: p2.username,
+        questionIndex: match.questionIndex,
+      });
+      
+      return; // Exit early — don't emit round_result
     }
   } else if (p1Correct) {
     p1Result = 'win'; p2Result = 'lose'; matchOver = true;
@@ -1027,108 +1093,94 @@ function evaluateRound(match, io) {
     },
   });
 
-  // If both answered correctly, notify view screen for merge animation
-  if (p1Correct && p2Correct && !matchOver) {
-    broadcastToSpectators('both_correct', {
-      matchId: match.matchId,
-      p1: p1.username,
-      p2: p2.username,
-    });
+  // At this point, matchOver is always true (both_correct returns early above)
+  const winner = p1Result === 'win' ? p1 : p2Result === 'win' ? p2 : null;
+  const loser  = p1Result === 'lose' ? p1 : p2Result === 'lose' ? p2 : null;
+
+  // Update leaderboard
+  if (winner) {
+    const wb = leaderboard.get(winner.username) || { username: winner.username, wins: 0, totalTime: 0 };
+    wb.wins = (wb.wins || 0) + 1;
+    const winnerAnswerTime = winner.answerTime || 0;
+    wb.totalTime = (wb.totalTime || 0) + winnerAnswerTime;
+    leaderboard.set(winner.username, wb);
+    broadcastLeaderboard();
   }
 
-  if (matchOver) {
-    const winner = p1Result === 'win' ? p1 : p2Result === 'win' ? p2 : null;
-    const loser  = p1Result === 'lose' ? p1 : p2Result === 'lose' ? p2 : null;
+  // Broadcast elimination + match-ended to view screens
+  if (loser) {
+    broadcastToSpectators('player_eliminated', { username: loser.username });
+  }
+  broadcastToSpectators('match_ended', {
+    matchId: match.matchId,
+    winner: winner?.username ?? null,
+    loser:  loser?.username ?? null,
+  });
 
-    // Update leaderboard
-    if (winner) {
-      const wb = leaderboard.get(winner.username) || { username: winner.username, wins: 0, totalTime: 0 };
-      wb.wins = (wb.wins || 0) + 1;
-      const winnerAnswerTime = winner.answerTime || 0;
-      wb.totalTime = (wb.totalTime || 0) + winnerAnswerTime;
-      leaderboard.set(winner.username, wb);
-      broadcastLeaderboard();
-    }
+  match.active = false;
+  setTimeout(() => matches.delete(match.matchId), 120000); // clean up after 2min
 
-    // Broadcast elimination + match-ended to view screens
+  // ── Tournament elimination bracket logic ────────────────────────────
+  if (match.tournamentRound) {
+    const round = match.tournamentRound;
+
+    // Evict loser from tournament
     if (loser) {
-      broadcastToSpectators('player_eliminated', { username: loser.username });
+      const lp = registeredPlayers.get(loser.deviceId);
+      if (lp) lp.status = 'eliminated';
+      TournamentPlayer.findOneAndUpdate(
+        { deviceId: loser.deviceId, tournamentId: tournamentConfig.scheduledDate },
+        { status: 'eliminated' }
+      ).catch(e => console.error('[bracket] DB evict error:', e.message));
+
+      const loserSocket = io.sockets.sockets.get(loser.socketId);
+      if (loserSocket) loserSocket.emit('tournament_eliminated', {
+        message: 'You have been eliminated from the tournament.',
+        round,
+      });
+      console.log(`[tournament R${round}] Eliminated: ${loser.username}`);
     }
-    broadcastToSpectators('match_ended', {
-      matchId: match.matchId,
-      winner: winner?.username ?? null,
-      loser:  loser?.username ?? null,
-    });
 
-    match.active = false;
-    setTimeout(() => matches.delete(match.matchId), 120000); // clean up after 2min
+    // Queue winner for the next round (both-wrong = no one advances, both eliminated)
+    if (winner) {
+      const wp = registeredPlayers.get(winner.deviceId);
+      if (wp) {
+        wp.wins = (wp.wins || 0) + 1;
+        wp.round = round + 1;
+        wp.status = 'waiting';
+      }
+      TournamentPlayer.findOneAndUpdate(
+        { deviceId: winner.deviceId, tournamentId: tournamentConfig.scheduledDate },
+        { $inc: { wins: 1 }, round: round + 1 }
+      ).catch(e => console.error('[bracket] DB winner update error:', e.message));
 
-    // ── Tournament elimination bracket logic ────────────────────────────
-    if (match.tournamentRound) {
-      const round = match.tournamentRound;
-
-      // Evict loser from tournament
-      if (loser) {
-        const lp = registeredPlayers.get(loser.deviceId);
-        if (lp) lp.status = 'eliminated';
-        TournamentPlayer.findOneAndUpdate(
-          { deviceId: loser.deviceId, tournamentId: tournamentConfig.scheduledDate },
-          { status: 'eliminated' }
-        ).catch(e => console.error('[bracket] DB evict error:', e.message));
-
-        const loserSocket = io.sockets.sockets.get(loser.socketId);
-        if (loserSocket) loserSocket.emit('tournament_eliminated', {
-          message: 'You have been eliminated from the tournament.',
+      // Notify winner they advance
+      const winnerSocket = io.sockets.sockets.get(winner.socketId);
+      if (winnerSocket) {
+        winnerSocket.emit('tournament_round_won', {
+          message: `You won Round ${round}! Waiting for next round...`,
           round,
+          nextRound: round + 1,
+          wins: wp?.wins || 1,
         });
-        console.log(`[tournament R${round}] Eliminated: ${loser.username}`);
       }
 
-      // Queue winner for the next round (both-wrong = no one advances, both eliminated)
-      if (winner) {
-        const wp = registeredPlayers.get(winner.deviceId);
-        if (wp) {
-          wp.wins = (wp.wins || 0) + 1;
-          wp.round = round + 1;
-          wp.status = 'waiting';
-        }
-        TournamentPlayer.findOneAndUpdate(
-          { deviceId: winner.deviceId, tournamentId: tournamentConfig.scheduledDate },
-          { $inc: { wins: 1 }, round: round + 1 }
-        ).catch(e => console.error('[bracket] DB winner update error:', e.message));
-
-        // Notify winner they advance
-        const winnerSocket = io.sockets.sockets.get(winner.socketId);
-        if (winnerSocket) {
-          winnerSocket.emit('tournament_round_won', {
-            message: `You won Round ${round}! Waiting for next round...`,
-            round,
-            nextRound: round + 1,
-            wins: wp?.wins || 1,
-          });
-        }
-
-        queueWinnerForNextRound(
-          { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
-          round
-        );
-      } else {
-        // Both wrong — both eliminated, check if round is now complete
-        const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
-        const waitingWinners = bracketWinners.get(round) || [];
-        if (activeRoundMatches.length === 0) {
-          if (waitingWinners.length >= 2) advanceToNextRound(round);
-          else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
-          else {
-            io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion this round.' });
-          }
+      queueWinnerForNextRound(
+        { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
+        round
+      );
+    } else {
+      // Both wrong — both eliminated, check if round is now complete
+      const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
+      const waitingWinners = bracketWinners.get(round) || [];
+      if (activeRoundMatches.length === 0) {
+        if (waitingWinners.length >= 2) advanceToNextRound(round);
+        else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
+        else {
+          io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion this round.' });
         }
       }
     }
-  } else {
-    // Reset answers for next question
-    p1.answer = null; p1.answerTime = null;
-    p2.answer = null; p2.answerTime = null;
   }
 }
 
