@@ -1072,17 +1072,6 @@ app.post('/api/users', async (req, res) => {
   }
 });
 
-// Get user by deviceId
-app.get('/api/users/:deviceId', async (req, res) => {
-  try {
-    const user = await User.findOne({ deviceId: req.params.deviceId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json(user);
-  } catch (err) {
-    res.status(500).json({ error: 'Server error' });
-  }
-});
-
 // Get all players
 app.get('/api/users', async (req, res) => {
   try {
@@ -1096,12 +1085,24 @@ app.get('/api/users', async (req, res) => {
 });
 
 // Get total number of registered players
+// NOTE: This must come BEFORE /api/users/:deviceId to avoid "count" being treated as a deviceId
 app.get('/api/users/count', async (req, res) => {
   try {
     const count = await User.countDocuments();
     res.json({ ok: true, count });
   } catch (err) {
     console.error('[api/users/count] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Get user by deviceId
+app.get('/api/users/:deviceId', async (req, res) => {
+  try {
+    const user = await User.findOne({ deviceId: req.params.deviceId });
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json(user);
+  } catch (err) {
     res.status(500).json({ error: 'Server error' });
   }
 });
