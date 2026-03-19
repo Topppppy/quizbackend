@@ -1009,12 +1009,19 @@ app.post('/api/users', async (req, res) => {
       return res.status(400).json({ error: 'Invalid username (max 30 chars)' });
     }
 
-    // Always upsert into general User collection
-    await User.findOneAndUpdate(
-      { deviceId },
-      { username, deviceId },
-      { upsert: true, returnDocument: 'after', runValidators: true }
-    );
+    // Check if user already exists
+    const existingUser = await User.findOne({ deviceId });
+    if (existingUser) {
+      return res.status(200).json({ 
+        ok: true, 
+        alreadyExists: true, 
+        message: "You're already in!", 
+        user: existingUser 
+      });
+    }
+
+    // Create new user
+    const user = await User.create({ username, deviceId });
 
     // If registration is open, also register into current tournament
     if (isRegistrationMode()) {
