@@ -10,6 +10,7 @@ const { QUESTIONS_DB } = require('./questions');
 const { BIBLE_QUESTIONS } = require('./bibleQuestions');
 const User              = require('./models/User');
 const TournamentPlayer  = require('./models/TournamentPlayer');
+const TournamentSchedule = require('./models/TournamentSchedule');
 
 // ─── Hardcoded admin credentials ─────────────────────────────────────────────
 const ADMIN_EMAIL    = 'indtropical@gmail.com';
@@ -1169,58 +1170,82 @@ app.get('/tournament/status', (_, res) => {
 // Admin: Set the bible quiz date & time — opens registration
 // Protected: requires admin JWT
 // Body: { date: '2026-03-20', time: '18:00' }  OR  { scheduledDate: '<ISO string>' }
-app.post('/admin/tournament/set-schedule', requireAdmin, (req, res) => {
-  const { date, time, scheduledDate: isoOverride } = req.body;
+app.post('/admin/tournament/set-schedule', requireAdmin, async (req, res) => {
+  try {
+    const { date, time, scheduledDate: isoOverride } = req.body;
 
-  let scheduledDate = isoOverride || null;
+    let scheduledDate = isoOverride || null;
 
-  if (!scheduledDate) {
-    if (!date || !time) {
-      return res.status(400).json({ error: 'Provide either { date, time } or { scheduledDate } (ISO string)' });
+    if (!scheduledDate) {
+      if (!date || !time) {
+        return res.status(400).json({ error: 'Provide either { date, time } or { scheduledDate } (ISO string)' });
+      }
+      // Combine date (YYYY-MM-DD) + time (HH:MM) into a full ISO string
+      scheduledDate = new Date(`${date}T${time}:00`).toISOString();
     }
-    // Combine date (YYYY-MM-DD) + time (HH:MM) into a full ISO string
-    scheduledDate = new Date(`${date}T${time}:00`).toISOString();
+
+    if (isNaN(new Date(scheduledDate).getTime())) {
+      return res.status(400).json({ error: 'Invalid date/time value' });
+    }
+
+    // Save to MongoDB
+    await TournamentSchedule.findOneAndUpdate(
+      { status: 'scheduled' },
+      { scheduledDate: new Date(scheduledDate), status: 'scheduled', registeredCount: 0 },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    tournamentConfig.scheduledDate = scheduledDate;
+    tournamentConfig.tournamentStarted = false;
+    registeredPlayers.clear();
+    bracketWinners.clear();
+    currentRound = 1;
+
+    scheduleAutoStart(scheduledDate);
+
+    io.emit('tournament_config_updated', {
+      scheduledDate,
+      registrationOpen: true,
+      tournamentStarted: false,
+    });
+
+    console.log(`[tournament] Bible quiz scheduled for ${scheduledDate} — registration open (saved to DB)`);
+    res.json({ ok: true, scheduledDate, message: 'Bible quiz scheduled! Registration is now open.' });
+  } catch (err) {
+    console.error('[admin/tournament/set-schedule] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
-
-  if (isNaN(new Date(scheduledDate).getTime())) {
-    return res.status(400).json({ error: 'Invalid date/time value' });
-  }
-
-  tournamentConfig.scheduledDate = scheduledDate;
-  tournamentConfig.tournamentStarted = false;
-  registeredPlayers.clear();
-  bracketWinners.clear();
-  currentRound = 1;
-
-  scheduleAutoStart(scheduledDate);
-
-  io.emit('tournament_config_updated', {
-    scheduledDate,
-    registrationOpen: true,
-    tournamentStarted: false,
-  });
-
-  console.log(`[tournament] Bible quiz scheduled for ${scheduledDate} — registration open`);
-  res.json({ ok: true, scheduledDate, message: 'Bible quiz scheduled! Registration is now open.' });
 });
 
 // Admin: Schedule a tournament (legacy alias — kept for backward compat)
-app.post('/admin/tournament/schedule', requireAdmin, (req, res) => {
-  const { scheduledDate } = req.body;
-  if (!scheduledDate) {
-    return res.status(400).json({ error: 'scheduledDate is required (ISO string)' });
+app.post('/admin/tournament/schedule', requireAdmin, async (req, res) => {
+  try {
+    const { scheduledDate } = req.body;
+    if (!scheduledDate) {
+      return res.status(400).json({ error: 'scheduledDate is required (ISO string)' });
+    }
+
+    // Save to MongoDB
+    await TournamentSchedule.findOneAndUpdate(
+      { status: 'scheduled' },
+      { scheduledDate: new Date(scheduledDate), status: 'scheduled', registeredCount: 0 },
+      { upsert: true, returnDocument: 'after' }
+    );
+
+    // Update in-memory config
+    tournamentConfig.scheduledDate = scheduledDate;
+    tournamentConfig.tournamentStarted = false;
+    registeredPlayers.clear();
+    bracketWinners.clear();
+    currentRound = 1;
+    scheduleAutoStart(scheduledDate);
+    io.emit('tournament_config_updated', { scheduledDate, registrationOpen: true, tournamentStarted: false });
+    console.log(`[tournament] Scheduled for ${scheduledDate} — registration open (saved to DB)`);
+    res.json({ ok: true, scheduledDate, message: 'Registration is now open!' });
+  } catch (err) {
+    console.error('[admin/tournament/schedule] Error:', err.message);
+    res.status(500).json({ error: 'Server error' });
   }
-  req.body.scheduledDate = scheduledDate;
-  // Delegate to set-schedule logic
-  tournamentConfig.scheduledDate = scheduledDate;
-  tournamentConfig.tournamentStarted = false;
-  registeredPlayers.clear();
-  bracketWinners.clear();
-  currentRound = 1;
-  scheduleAutoStart(scheduledDate);
-  io.emit('tournament_config_updated', { scheduledDate, registrationOpen: true, tournamentStarted: false });
-  console.log(`[tournament] Scheduled for ${scheduledDate} — registration open`);
-  res.json({ ok: true, scheduledDate, message: 'Registration is now open!' });
 });
 
 // Admin: Get all registered players
