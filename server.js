@@ -78,6 +78,32 @@ function canStartPlaying() {
   return tournamentConfig.tournamentStarted;
 }
 
+// Get count of currently connected (active) players
+function getActivePlayerCount() {
+  let count = 0;
+  for (const player of registeredPlayers.values()) {
+    if (player.socketId) {
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (socket && socket.connected) count++;
+    }
+  }
+  return count;
+}
+
+// Get list of currently connected players
+function getActivePlayers() {
+  const active = [];
+  for (const player of registeredPlayers.values()) {
+    if (player.socketId) {
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (socket && socket.connected) {
+        active.push(player);
+      }
+    }
+  }
+  return active;
+}
+
 // Auto-start timer reference
 let autoStartTimer = null;
 
@@ -120,7 +146,9 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
 
     const s1 = io.sockets.sockets.get(p1.socketId);
     const s2 = io.sockets.sockets.get(p2.socketId);
-    const matchPayload = { 
+    
+    // Build match payload for each player - include their own info AND opponent info
+    const basePayload = { 
       matchId: match.matchId, 
       matchSeed: match.seed, 
       questions: match.questions,
@@ -131,11 +159,19 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
 
     if (s1) { 
       s1.join(match.matchId); 
-      s1.emit('match_found', { ...matchPayload, opponent: { username: p2.username, id: p2.deviceId } }); 
+      s1.emit('match_found', { 
+        ...basePayload, 
+        you: { username: p1.username, deviceId: p1.deviceId },
+        opponent: { username: p2.username, deviceId: p2.deviceId } 
+      }); 
     }
     if (s2) { 
       s2.join(match.matchId); 
-      s2.emit('match_found', { ...matchPayload, opponent: { username: p1.username, id: p1.deviceId } }); 
+      s2.emit('match_found', { 
+        ...basePayload, 
+        you: { username: p2.username, deviceId: p2.deviceId },
+        opponent: { username: p1.username, deviceId: p1.deviceId } 
+      }); 
     }
 
     console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId} (${questionsPerMatch} questions)`);
@@ -184,19 +220,32 @@ function advanceToNextRound(completedRound) {
   const advancingPlayers = bracketWinners.get(completedRound) || [];
   bracketWinners.delete(completedRound);
 
-  console.log(`[tournament] Round ${completedRound} complete — ${advancingPlayers.length} players advance to Round ${nextRound}`);
+  // Filter to only include still-connected players
+  const connectedAdvancers = advancingPlayers.filter(p => {
+    if (!p.socketId) return false;
+    const socket = io.sockets.sockets.get(p.socketId);
+    return socket && socket.connected;
+  });
 
-  if (advancingPlayers.length === 1) {
-    declareTournamentChampion(advancingPlayers[0]);
+  console.log(`[tournament] Round ${completedRound} complete — ${advancingPlayers.length} winners, ${connectedAdvancers.length} still connected`);
+
+  if (connectedAdvancers.length === 0) {
+    console.log(`[tournament] No connected players remain — tournament ends`);
+    io.emit('tournament_ended', { reason: 'All remaining players disconnected' });
+    return;
+  }
+
+  if (connectedAdvancers.length === 1) {
+    declareTournamentChampion(connectedAdvancers[0]);
     return;
   }
 
   // Calculate questions per match based on remaining player count
-  const questionsPerMatch = getQuestionsPerMatch(advancingPlayers.length);
-  console.log(`[tournament] Round ${nextRound}: Using ${questionsPerMatch} questions per match for ${advancingPlayers.length} players`);
+  const questionsPerMatch = getQuestionsPerMatch(connectedAdvancers.length);
+  console.log(`[tournament] Round ${nextRound}: Using ${questionsPerMatch} questions per match for ${connectedAdvancers.length} players`);
 
-  io.emit('tournament_next_round', { round: nextRound, playerCount: advancingPlayers.length, questionsPerMatch });
-  pairPlayersForRound(advancingPlayers, nextRound, questionsPerMatch);
+  io.emit('tournament_next_round', { round: nextRound, playerCount: connectedAdvancers.length, questionsPerMatch });
+  pairPlayersForRound(connectedAdvancers, nextRound, questionsPerMatch);
 }
 
 // Declare the overall tournament champion
@@ -589,6 +638,12 @@ io.on('connection', (socket) => {
     if (deviceId) {
       lobby.delete(deviceId);
       broadcastLobbyCount();
+      
+      // Broadcast updated active count during tournament registration
+      if (tournamentState.registrationMode) {
+        const activeCount = getActiveConnectedCount();
+        io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
+      }
       // Mark player as disconnected in any active match
       for (const [matchId, match] of matches) {
         if (match.players[deviceId] && match.active) {
@@ -696,12 +751,19 @@ io.on('connection', (socket) => {
       if (registeredPlayers.has(deviceId)) {
         const rp = registeredPlayers.get(deviceId);
         rp.socketId = socket.id;
+        
+        const activeCount = getActivePlayerCount();
         socket.emit('tournament_waiting', {
           message: 'You are registered! Waiting for tournament to start...',
           waitingCount: registeredPlayers.size,
+          activeCount: activeCount,
           scheduledDate: tournamentConfig.scheduledDate,
         });
-        console.log(`[tournament] ${username} reconnected socket (${registeredPlayers.size} waiting)`);
+        
+        // Broadcast updated active count to all clients
+        io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
+        
+        console.log(`[tournament] ${username} reconnected socket (${registeredPlayers.size} registered, ${activeCount} active)`);
         return;
       }
 
@@ -762,17 +824,20 @@ io.on('connection', (socket) => {
             leaderboard.set(existingUser.username, { username: existingUser.username, wins: 0, stage: 'waiting' });
           }
           
+          const activeCount = getActivePlayerCount();
           socket.emit('tournament_waiting', {
             message: 'You are registered! Waiting for tournament to start...',
             waitingCount: registeredPlayers.size,
+            activeCount: activeCount,
             scheduledDate: tournamentConfig.scheduledDate,
           });
           
-          // Broadcast to spectators
-          broadcastToSpectators('player_joined', { username: existingUser.username, waitingCount: registeredPlayers.size });
+          // Broadcast to spectators and all clients
+          broadcastToSpectators('player_joined', { username: existingUser.username, waitingCount: registeredPlayers.size, activeCount });
           io.emit('waiting_count', { count: registeredPlayers.size });
+          io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
           
-          console.log(`[tournament] ${existingUser.username} registered via socket + saved to DB (${registeredPlayers.size} waiting)`);
+          console.log(`[tournament] ${existingUser.username} registered via socket + saved to DB (${registeredPlayers.size} registered, ${activeCount} active)`);
         } catch (err) {
           console.error(`[tournament] DB error registering ${username}:`, err.message);
           socket.emit('registration_error', { 
@@ -1380,12 +1445,18 @@ app.get('/api/bible-questions', (_, res) => {
 // ─── Tournament REST endpoints ───────────────────────────────────────────────
 // Get tournament status (public)
 app.get('/tournament/status', (_, res) => {
+  const activePlayers = getActivePlayers();
   res.json({
     scheduledDate: tournamentConfig.scheduledDate,
     tournamentStarted: tournamentConfig.tournamentStarted,
     registrationOpen: isRegistrationMode(),
     registeredCount: registeredPlayers.size,
-    players: [...registeredPlayers.values()].map(p => ({ username: p.username, joinedAt: p.joinedAt })),
+    activeCount: activePlayers.length,
+    players: [...registeredPlayers.values()].map(p => {
+      const socket = p.socketId ? io.sockets.sockets.get(p.socketId) : null;
+      const isOnline = socket && socket.connected;
+      return { username: p.username, joinedAt: p.joinedAt, isOnline };
+    }),
   });
 });
 
