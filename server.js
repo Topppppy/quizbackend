@@ -119,10 +119,23 @@ function pairPlayersForRound(players, round) {
 
     const s1 = io.sockets.sockets.get(p1.socketId);
     const s2 = io.sockets.sockets.get(p2.socketId);
-    const matchPayload = { matchId: match.matchId, matchSeed: match.seed, questions: match.questions, round };
+    const matchPayload = { 
+      matchId: match.matchId, 
+      matchSeed: match.seed, 
+      questions: match.questions,  // 5 Bible questions for this match
+      round,
+      totalQuestions: match.questions?.length || 5,
+      isTournament: true,
+    };
 
-    if (s1) { s1.join(match.matchId); s1.emit('match_found', { ...matchPayload, opponent: { username: p2.username, id: p2.deviceId } }); }
-    if (s2) { s2.join(match.matchId); s2.emit('match_found', { ...matchPayload, opponent: { username: p1.username, id: p1.deviceId } }); }
+    if (s1) { 
+      s1.join(match.matchId); 
+      s1.emit('match_found', { ...matchPayload, opponent: { username: p2.username, id: p2.deviceId } }); 
+    }
+    if (s2) { 
+      s2.join(match.matchId); 
+      s2.emit('match_found', { ...matchPayload, opponent: { username: p1.username, id: p1.deviceId } }); 
+    }
 
     console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId}`);
   }
@@ -214,17 +227,36 @@ function startTournament() {
   currentRound = 1;
   bracketWinners.clear();
 
-  const players = [...registeredPlayers.values()];
-  const matchPairs = pairPlayersForRound(players, 1);
+  // Update tournament status in DB
+  TournamentSchedule.findOneAndUpdate(
+    { status: 'scheduled' },
+    { status: 'started' }
+  ).catch(e => console.error('[tournament] DB status update error:', e.message));
 
+  const players = [...registeredPlayers.values()];
+  
+  // Broadcast tournament start with Bible questions bank to all clients
+  // Each paired match will get specific questions, but clients need the full bank for display
   io.emit('tournament_started', {
     message: 'Tournament is starting!',
+    playerCount: registeredPlayers.size,
+    round: 1,
+    bibleQuestions: BIBLE_QUESTIONS, // Send full question bank to frontend
+  });
+
+  // Now pair all registered players for Round 1
+  const matchPairs = pairPlayersForRound(players, 1);
+
+  // Notify spectators
+  broadcastToSpectators('tournament_started', {
     playerCount: registeredPlayers.size,
     matchCount: matchPairs.length,
     round: 1,
   });
 
-  console.log(`[tournament] Started with ${registeredPlayers.size} players, ${matchPairs.length} Round-1 matches`);
+  console.log(`[tournament] 🎮 Started with ${registeredPlayers.size} players, ${matchPairs.length} Round-1 matches`);
+  console.log(`[tournament] 📚 Sent ${BIBLE_QUESTIONS.length} Bible questions to all clients`);
+  
   return { ok: true, playerCount: registeredPlayers.size, matches: matchPairs, round: 1 };
 }
 
@@ -242,10 +274,33 @@ function scheduleAutoStart(scheduledDate) {
   if (delay <= 0) {
     // Time already passed — start immediately if possible
     console.log('[tournament] Scheduled time already passed — auto-starting now');
+    io.emit('tournament_countdown', { secondsRemaining: 0, message: 'Tournament starting NOW!' });
     const result = startTournament();
     if (result.error) console.log(`[tournament] Auto-start failed: ${result.error}`);
     return;
   }
+
+  // Schedule countdown warnings at 5min, 1min, 30s, 10s before start
+  const countdownWarnings = [
+    { ms: 5 * 60 * 1000, msg: '5 minutes' },
+    { ms: 1 * 60 * 1000, msg: '1 minute' },
+    { ms: 30 * 1000, msg: '30 seconds' },
+    { ms: 10 * 1000, msg: '10 seconds' },
+    { ms: 5 * 1000, msg: '5 seconds' },
+  ];
+
+  countdownWarnings.forEach(({ ms, msg }) => {
+    const warningDelay = delay - ms;
+    if (warningDelay > 0) {
+      setTimeout(() => {
+        io.emit('tournament_countdown', { 
+          secondsRemaining: Math.round(ms / 1000), 
+          message: `Tournament starts in ${msg}!` 
+        });
+        console.log(`[tournament] ⏱️  Countdown: ${msg} remaining`);
+      }, warningDelay);
+    }
+  });
 
   console.log(`[tournament] Auto-start scheduled in ${Math.round(delay / 1000)}s (${scheduledDate})`);
   autoStartTimer = setTimeout(() => {
@@ -972,6 +1027,17 @@ function evaluateRound(match, io) {
           { $inc: { wins: 1 }, round: round + 1 }
         ).catch(e => console.error('[bracket] DB winner update error:', e.message));
 
+        // Notify winner they advance
+        const winnerSocket = io.sockets.sockets.get(winner.socketId);
+        if (winnerSocket) {
+          winnerSocket.emit('tournament_round_won', {
+            message: `You won Round ${round}! Waiting for next round...`,
+            round,
+            nextRound: round + 1,
+            wins: wp?.wins || 1,
+          });
+        }
+
         queueWinnerForNextRound(
           { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
           round
@@ -1001,24 +1067,47 @@ function evaluateRound(match, io) {
 // Also saves to the persistent User collection for general user tracking.
 app.post('/api/users', async (req, res) => {
   try {
-    const { username, deviceId } = req.body;
+    let { username, deviceId } = req.body;
 
     if (!username || !deviceId) {
       return res.status(400).json({ error: 'username and deviceId are required' });
     }
-    if (typeof username !== 'string' || username.length > 30) {
-      return res.status(400).json({ error: 'Invalid username (max 30 chars)' });
+
+    // Normalize username: trim whitespace and convert to lowercase
+    username = String(username).trim().toLowerCase();
+
+    // Validate username
+    if (username.length < 3) {
+      return res.status(400).json({ error: 'Username must be at least 3 characters' });
+    }
+    if (username.length > 30) {
+      return res.status(400).json({ error: 'Username must be 30 characters or less' });
+    }
+    // Only allow alphanumeric characters, underscores, and hyphens
+    if (!/^[a-z0-9_-]+$/.test(username)) {
+      return res.status(400).json({ error: 'Username can only contain letters, numbers, underscores, and hyphens' });
+    }
+    // Check for reserved/inappropriate usernames
+    const reservedUsernames = ['admin', 'administrator', 'system', 'bot', 'null', 'undefined', 'test'];
+    if (reservedUsernames.includes(username)) {
+      return res.status(400).json({ error: 'This username is not allowed' });
     }
 
-    // Check if user already exists
-    const existingUser = await User.findOne({ deviceId });
-    if (existingUser) {
+    // Check if device already registered
+    const existingUserByDevice = await User.findOne({ deviceId });
+    if (existingUserByDevice) {
       return res.status(200).json({ 
         ok: true, 
         alreadyExists: true, 
         message: "You're already in!", 
-        user: existingUser 
+        user: existingUserByDevice 
       });
+    }
+
+    // Check if username is already taken (case-insensitive due to lowercase normalization)
+    const existingUserByUsername = await User.findOne({ username });
+    if (existingUserByUsername) {
+      return res.status(409).json({ error: 'Username is already taken. Please choose another.' });
     }
 
     // Create new user
@@ -1155,6 +1244,16 @@ app.get('/admin/special-session', (_, res) => res.json(specialSession));
 
 // ─── Leaderboard REST endpoint ────────────────────────────────────────────────
 app.get('/leaderboard', (_, res) => res.json(getLeaderboardArray()));
+
+// ─── Bible Questions endpoint (for tournament) ───────────────────────────────
+// Returns the full Bible questions bank for the tournament
+app.get('/api/bible-questions', (_, res) => {
+  res.json({
+    ok: true,
+    count: BIBLE_QUESTIONS.length,
+    questions: BIBLE_QUESTIONS,
+  });
+});
 
 // ─── Tournament REST endpoints ───────────────────────────────────────────────
 // Get tournament status (public)
