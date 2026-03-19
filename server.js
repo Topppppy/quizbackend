@@ -94,7 +94,7 @@ function shuffleArray(arr) {
 
 // Pair a list of players into Bible quiz matches for the current round.
 // Returns the list of match descriptors created.
-function pairPlayersForRound(players, round) {
+function pairPlayersForRound(players, round, questionsPerMatch = 5) {
   shuffleArray(players);
   const matchPairs = [];
 
@@ -105,7 +105,8 @@ function pairPlayersForRound(players, round) {
     const match = createMatch(
       { deviceId: p1.deviceId, username: p1.username, socketId: p1.socketId },
       { deviceId: p2.deviceId, username: p2.username, socketId: p2.socketId },
-      true // always Bible quiz for tournament
+      true, // always Bible quiz for tournament
+      questionsPerMatch
     );
     // Tag the match with round info so evaluateRound can trigger next-round logic
     match.tournamentRound = round;
@@ -122,9 +123,9 @@ function pairPlayersForRound(players, round) {
     const matchPayload = { 
       matchId: match.matchId, 
       matchSeed: match.seed, 
-      questions: match.questions,  // 5 Bible questions for this match
+      questions: match.questions,
       round,
-      totalQuestions: match.questions?.length || 5,
+      totalQuestions: match.questions?.length || questionsPerMatch,
       isTournament: true,
     };
 
@@ -137,7 +138,7 @@ function pairPlayersForRound(players, round) {
       s2.emit('match_found', { ...matchPayload, opponent: { username: p1.username, id: p1.deviceId } }); 
     }
 
-    console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId}`);
+    console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId} (${questionsPerMatch} questions)`);
   }
 
   // Odd player out → automatic bye (advances to next round)
@@ -190,8 +191,12 @@ function advanceToNextRound(completedRound) {
     return;
   }
 
-  io.emit('tournament_next_round', { round: nextRound, playerCount: advancingPlayers.length });
-  pairPlayersForRound(advancingPlayers, nextRound);
+  // Calculate questions per match based on remaining player count
+  const questionsPerMatch = getQuestionsPerMatch(advancingPlayers.length);
+  console.log(`[tournament] Round ${nextRound}: Using ${questionsPerMatch} questions per match for ${advancingPlayers.length} players`);
+
+  io.emit('tournament_next_round', { round: nextRound, playerCount: advancingPlayers.length, questionsPerMatch });
+  pairPlayersForRound(advancingPlayers, nextRound, questionsPerMatch);
 }
 
 // Declare the overall tournament champion
@@ -233,7 +238,26 @@ function startTournament() {
     { status: 'started' }
   ).catch(e => console.error('[tournament] DB status update error:', e.message));
 
-  const players = [...registeredPlayers.values()];
+  // Only include players who have an active socket connection
+  const allPlayers = [...registeredPlayers.values()];
+  const connectedPlayers = allPlayers.filter(p => {
+    if (!p.socketId) return false;
+    const socket = io.sockets.sockets.get(p.socketId);
+    return socket && socket.connected;
+  });
+
+  console.log(`[tournament] ${allPlayers.length} registered, ${connectedPlayers.length} connected`);
+
+  if (connectedPlayers.length < 2) {
+    tournamentConfig.tournamentStarted = false; // Rollback
+    return { error: `Only ${connectedPlayers.length} players connected. Need at least 2.` };
+  }
+
+  const players = connectedPlayers;
+  
+  // Calculate questions per match based on player count
+  const questionsPerMatch = getQuestionsPerMatch(connectedPlayers.length);
+  console.log(`[tournament] Using ${questionsPerMatch} questions per match for ${connectedPlayers.length} players`);
   
   // Broadcast tournament start with Bible questions bank to all clients
   // Each paired match will get specific questions, but clients need the full bank for display
@@ -241,11 +265,12 @@ function startTournament() {
     message: 'Tournament is starting!',
     playerCount: registeredPlayers.size,
     round: 1,
+    questionsPerMatch: questionsPerMatch,
     bibleQuestions: BIBLE_QUESTIONS, // Send full question bank to frontend
   });
 
   // Now pair all registered players for Round 1
-  const matchPairs = pairPlayersForRound(players, 1);
+  const matchPairs = pairPlayersForRound(players, 1, questionsPerMatch);
 
   // Notify spectators
   broadcastToSpectators('tournament_started', {
@@ -501,11 +526,23 @@ function sendViewState(socket) {
 }
 
 // ─── Match factory ────────────────────────────────────────────────────────────
-function createMatch(p1, p2, isSpecialSession = false) {
+
+// Calculate questions per match based on number of players in tournament
+function getQuestionsPerMatch(playerCount) {
+  // More players = more rounds = can have fewer questions per match
+  // Fewer players = fewer rounds = need more questions per match for excitement
+  if (playerCount <= 4) return 10;      // 2 rounds max → 10 questions per match
+  if (playerCount <= 8) return 7;       // 3 rounds max → 7 questions per match
+  if (playerCount <= 16) return 5;      // 4 rounds max → 5 questions per match
+  if (playerCount <= 32) return 5;      // 5 rounds max → 5 questions per match
+  return 3;                              // 6+ rounds → 3 questions per match (faster games)
+}
+
+function createMatch(p1, p2, isSpecialSession = false, questionsCount = 5) {
   const matchId = 'match_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
   const seed    = matchId;
 
-  // Pick 5 questions from the right bank
+  // Pick questions from the right bank
   // Bible quiz (special session) uses Bible questions, normal matches use frontend seeded questions
   let bank = isSpecialSession && BIBLE_QUESTIONS.length > 0
     ? BIBLE_QUESTIONS
@@ -513,17 +550,18 @@ function createMatch(p1, p2, isSpecialSession = false) {
 
   let questions = null;
   if (bank) {
-    // Repeat pool if fewer than 5
+    // Repeat pool if fewer than needed
     let pool = bank;
-    while (pool.length < 5) pool = [...pool, ...bank];
-    questions = seededShuffle(pool, seed).slice(0, 5);
+    while (pool.length < questionsCount) pool = [...pool, ...bank];
+    questions = seededShuffle(pool, seed).slice(0, questionsCount);
   }
-  // If bank is null, frontend uses getSeededQuestions(5, [], seed) — same seed = same questions
+  // If bank is null, frontend uses getSeededQuestions(questionsCount, [], seed) — same seed = same questions
 
   const match = {
     matchId,
     seed,
     questions,          // null = use seeded frontend bank; array = use these exact questions
+    questionsCount,     // Track how many questions this match should have
     players: {
       [p1.deviceId]: { ...p1, answer: null, answerTime: null, ready: false, connected: true },
       [p2.deviceId]: { ...p2, answer: null, answerTime: null, ready: false, connected: true },
@@ -910,17 +948,49 @@ function evaluateRound(match, io) {
   let p1Result, p2Result, matchOver = false;
 
   if (p1Correct && p2Correct) {
+    // Both correct — continue with another question (no speed tiebreak)
     match.bothCorrectCount = (match.bothCorrectCount || 0) + 1;
-    if (match.bothCorrectCount >= 3 || match.questionIndex >= (match.questions.length - 1)) {
-      // Speed tiebreak — faster answer wins
-      p1Result = p1.answerTime <= p2.answerTime ? 'win' : 'lose';
-      p2Result = p1Result === 'win' ? 'lose' : 'win';
-      matchOver = true;
-    } else {
-      p1Result = 'next';
-      p2Result = 'next';
+    
+    // Check if we've exhausted all questions in current set
+    if (match.questionIndex >= match.questions.length - 1) {
+      // Need more questions — fetch additional ones from the bank
+      const usedIds = new Set(match.questions.map(q => q.id));
+      const availableQuestions = BIBLE_QUESTIONS.filter(q => !usedIds.has(q.id));
+      
+      if (availableQuestions.length > 0) {
+        // Add 5 more questions (or however many are available)
+        const newQuestions = seededShuffle(availableQuestions, match.matchId + '_extra_' + match.bothCorrectCount)
+          .slice(0, 5);
+        match.questions = [...match.questions, ...newQuestions];
+        console.log(`[match] ${match.matchId} both correct ${match.bothCorrectCount}x — added ${newQuestions.length} more questions`);
+      } else {
+        // Truly exhausted all questions — use speed tiebreak as last resort
+        console.log(`[match] ${match.matchId} exhausted all ${BIBLE_QUESTIONS.length} questions — speed tiebreak`);
+        p1Result = p1.answerTime <= p2.answerTime ? 'win' : 'lose';
+        p2Result = p1Result === 'win' ? 'lose' : 'win';
+        matchOver = true;
+      }
+    }
+    
+    if (!matchOver) {
+      p1Result = 'both_correct';
+      p2Result = 'both_correct';
       match.questionIndex++;
-      match.questionStartTime = Date.now(); // reset timing for next question
+      match.questionStartTime = Date.now();
+      
+      // Send the next question to both players
+      const nextQuestion = match.questions[match.questionIndex];
+      const nextQuestionPayload = {
+        questionIndex: match.questionIndex,
+        question: nextQuestion,
+        bothCorrectCount: match.bothCorrectCount,
+        message: 'Both correct! Here\'s another question.',
+      };
+      
+      [p1, p2].forEach(player => {
+        const sock = io.sockets.sockets.get(player.socketId);
+        if (sock) sock.emit('next_question', nextQuestionPayload);
+      });
     }
   } else if (p1Correct) {
     p1Result = 'win'; p2Result = 'lose'; matchOver = true;
