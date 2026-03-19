@@ -995,12 +995,6 @@ function evaluateRound(match, io) {
   }
 }
 
-// ─── MongoDB connection ───────────────────────────────────────────────────────
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => console.log('✅ Connected to MongoDB'))
-  .catch((err) => console.error('❌ MongoDB connection error:', err));
-
 // ─── Tournament player registration (save username + deviceId to MongoDB) ──────
 // Called from the frontend when a user wants to join the tournament.
 // Also saves to the persistent User collection for general user tracking.
@@ -1019,7 +1013,7 @@ app.post('/api/users', async (req, res) => {
     await User.findOneAndUpdate(
       { deviceId },
       { username, deviceId },
-      { upsert: true, new: true, runValidators: true }
+      { upsert: true, returnDocument: 'after', runValidators: true }
     );
 
     // If registration is open, also register into current tournament
@@ -1032,7 +1026,7 @@ app.post('/api/users', async (req, res) => {
       await TournamentPlayer.findOneAndUpdate(
         { deviceId, tournamentId: tournamentConfig.scheduledDate },
         { username, deviceId, tournamentId: tournamentConfig.scheduledDate, status: 'waiting', wins: 0, round: 1 },
-        { upsert: true, new: true, runValidators: true }
+        { upsert: true, returnDocument: 'after', runValidators: true }
       );
 
       // Register in-memory
@@ -1503,4 +1497,16 @@ app.post('/admin/demo/stop', (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`\n🚀 QuizDuel server listening on http://localhost:${PORT}\n`));
+
+async function startServer() {
+  try {
+    await mongoose.connect(process.env.MONGO_URI);
+    console.log('✅ Connected to MongoDB');
+    server.listen(PORT, () => console.log(`\n🚀 QuizDuel server listening on http://localhost:${PORT}\n`));
+  } catch (err) {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
+  }
+}
+
+startServer();
