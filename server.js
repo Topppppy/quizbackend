@@ -1579,6 +1579,19 @@ async function startServer() {
   try {
     await mongoose.connect(process.env.MONGO_URI);
     console.log('✅ Connected to MongoDB');
+
+    // Load persisted tournament schedule from MongoDB on startup
+    const savedSchedule = await TournamentSchedule.findOne({ status: 'scheduled' });
+    if (savedSchedule && savedSchedule.scheduledDate) {
+      const isoDate = savedSchedule.scheduledDate.toISOString();
+      tournamentConfig.scheduledDate = isoDate;
+      tournamentConfig.tournamentStarted = false;
+      console.log(`✅ Loaded tournament schedule from DB: ${isoDate}`);
+
+      // Re-schedule auto-start if the time hasn't passed yet
+      scheduleAutoStart(isoDate);
+    }
+
     server.listen(PORT, () => console.log(`\n🚀 QuizDuel server listening on http://localhost:${PORT}\n`));
   } catch (err) {
     console.error('❌ MongoDB connection error:', err);
