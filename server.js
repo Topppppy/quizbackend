@@ -768,45 +768,62 @@ io.on('connection', (socket) => {
       }
 
       // Otherwise register them now (fallback for socket-only clients)
-      // First, persist to database (User + TournamentPlayer)
+      // First, check if user already exists in DB
       (async () => {
         try {
           // Check if user already exists in DB by deviceId
           let existingUser = await User.findOne({ deviceId });
           
-          if (!existingUser) {
-            // Normalize username
-            const normalizedUsername = String(username).trim().toLowerCase();
+          if (existingUser) {
+            // User already exists — just register in-memory and let them join
+            registeredPlayers.set(deviceId, {
+              username: existingUser.username,
+              deviceId,
+              joinedAt: Date.now(),
+              socketId: socket.id,
+              wins: 0,
+              round: 1,
+              status: 'waiting',
+            });
             
-            // Check if username is already taken
-            const usernameTaken = await User.findOne({ username: normalizedUsername });
-            if (usernameTaken) {
-              socket.emit('registration_error', { 
-                error: 'Username is already taken. Please choose another.',
-                code: 'USERNAME_TAKEN'
-              });
-              console.log(`[tournament] ${username} rejected — username taken`);
-              return;
+            if (!leaderboard.has(existingUser.username)) {
+              leaderboard.set(existingUser.username, { username: existingUser.username, wins: 0, stage: 'waiting' });
             }
             
-            // Create user in DB
-            existingUser = await User.create({ username: normalizedUsername, deviceId });
-            console.log(`[tournament] ${normalizedUsername} saved to User collection`);
+            const activeCount = getActivePlayerCount();
+            socket.emit('tournament_waiting', {
+              message: 'You are registered! Waiting for tournament to start...',
+              waitingCount: registeredPlayers.size,
+              activeCount: activeCount,
+              scheduledDate: tournamentConfig.scheduledDate,
+            });
+            
+            broadcastToSpectators('player_joined', { username: existingUser.username, waitingCount: registeredPlayers.size, activeCount });
+            io.emit('waiting_count', { count: registeredPlayers.size });
+            io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
+            
+            console.log(`[tournament] ${existingUser.username} logged in via socket (${registeredPlayers.size} registered, ${activeCount} active)`);
+            return;
           }
 
-          // Save to TournamentPlayer collection
-          await TournamentPlayer.findOneAndUpdate(
-            { deviceId, tournamentId: tournamentConfig.scheduledDate },
-            { 
-              username: existingUser.username, 
-              deviceId, 
-              tournamentId: tournamentConfig.scheduledDate, 
-              status: 'waiting', 
-              wins: 0, 
-              round: 1 
-            },
-            { upsert: true }
-          );
+          // New user — need to create them
+          // Normalize username
+          const normalizedUsername = String(username).trim().toLowerCase();
+          
+          // Check if username is already taken
+          const usernameTaken = await User.findOne({ username: normalizedUsername });
+          if (usernameTaken) {
+            socket.emit('registration_error', { 
+              error: 'Username is already taken. Please choose another.',
+              code: 'USERNAME_TAKEN'
+            });
+            console.log(`[tournament] ${username} rejected — username taken`);
+            return;
+          }
+          
+          // Create user in DB
+          existingUser = await User.create({ username: normalizedUsername, deviceId });
+          console.log(`[tournament] ${normalizedUsername} saved to User collection`);
 
           // Register in-memory
           registeredPlayers.set(deviceId, {
@@ -837,7 +854,7 @@ io.on('connection', (socket) => {
           io.emit('waiting_count', { count: registeredPlayers.size });
           io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
           
-          console.log(`[tournament] ${existingUser.username} registered via socket + saved to DB (${registeredPlayers.size} registered, ${activeCount} active)`);
+          console.log(`[tournament] ${existingUser.username} registered via socket (${registeredPlayers.size} registered, ${activeCount} active)`);
         } catch (err) {
           console.error(`[tournament] DB error registering ${username}:`, err.message);
           socket.emit('registration_error', { 
