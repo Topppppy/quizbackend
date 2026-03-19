@@ -640,8 +640,8 @@ io.on('connection', (socket) => {
       broadcastLobbyCount();
       
       // Broadcast updated active count during tournament registration
-      if (tournamentState.registrationMode) {
-        const activeCount = getActiveConnectedCount();
+      if (isRegistrationMode()) {
+        const activeCount = getActivePlayerCount();
         io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
       }
       // Mark player as disconnected in any active match
