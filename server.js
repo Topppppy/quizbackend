@@ -379,9 +379,17 @@ function scheduleAutoStart(scheduledDate) {
   console.log(`[tournament] Auto-start scheduled in ${Math.round(delay / 1000)}s (${scheduledDate})`);
   autoStartTimer = setTimeout(() => {
     console.log('[tournament] ⏰ Auto-starting tournament now!');
+    io.emit('tournament_countdown', { secondsRemaining: 0, message: 'Tournament starting NOW!' });
     const result = startTournament();
     if (result.error) {
       console.log(`[tournament] Auto-start failed: ${result.error}`);
+      // Notify all clients that auto-start failed
+      io.emit('tournament_auto_start_failed', { 
+        error: result.error,
+        message: `Tournament could not auto-start: ${result.error}`,
+        registeredCount: registeredPlayers.size,
+        activeCount: getActivePlayerCount(),
+      });
     }
   }, delay);
 }
