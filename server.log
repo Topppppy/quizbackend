@@ -1,8 +1,29 @@
-[dotenv@17.3.1] injecting env (3) from .env -- tip: ⚙️  override existing env vars with { override: true }
-❌ MongoDB connection error: Error: queryTxt ESERVFAIL cluster0.kiam0fk.mongodb.net
-    at QueryReqWrap.onresolve [as oncomplete] (node:internal/dns/promises:294:17) {
-  errno: undefined,
-  code: 'ESERVFAIL',
-  syscall: 'queryTxt',
-  hostname: 'cluster0.kiam0fk.mongodb.net'
+[dotenv@17.3.1] injecting env (3) from .env -- tip: ⚙️  specify custom .env file path with { path: '/custom/path/.env' }
+✅ Connected to MongoDB
+✅ Loaded tournament schedule from DB: 2026-03-20T17:00:00.000Z
+[tournament] scheduleAutoStart called:
+  - Scheduled: 2026-03-20T17:00:00.000Z
+  - Server now: 2026-03-20T11:46:08.414Z
+  - Delay: 18832s (314 min)
+[tournament] ✅ Auto-start timer SET — will fire in 18832s
+node:events:496
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::4000
+    at Server.setupListenHandle [as _listen2] (node:net:1939:16)
+    at listenInCluster (node:net:1996:12)
+    at Server.listen (node:net:2101:7)
+    at startServer (/Users/toppy/Desktop/quiztournament/server/server.js:2604:10)
+    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1975:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+  code: 'EADDRINUSE',
+  errno: -48,
+  syscall: 'listen',
+  address: '::',
+  port: 4000
 }
+
+Node.js v22.16.0

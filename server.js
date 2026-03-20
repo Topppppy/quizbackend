@@ -1655,6 +1655,7 @@ function evaluateRound(match, io) {
         bothCorrectCount: match.bothCorrectCount,
         totalQuestions: match.questions.length,
         message: 'Both correct! Here\'s another question.',
+        isTournament: !!match.tournamentRound,
       };
       
       [p1, p2].forEach(player => {
@@ -1693,6 +1694,7 @@ function evaluateRound(match, io) {
         myAnswer: player.answer,
         opponentAnswer: Object.values(match.players).find(p => p.deviceId !== player.deviceId).answer,
         matchOver,
+        isTournament: !!match.tournamentRound,
       });
     }
   };
