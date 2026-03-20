@@ -80,6 +80,15 @@ const playersInMatch = new Set(); // deviceIds of players currently in a match
 // Server-driven match timers: matchId → { timer, currentQuestion, questionStartTime }
 const matchTimers = new Map();
 
+// ─── Tournament Pacing Settings ──────────────────────────────────────────────
+// Adjust these to control how fast the tournament runs
+const TOURNAMENT_PACING = {
+  QUESTION_TIME_SECONDS: 10,       // Seconds per question (10 = fast, 15-20 = relaxed)
+  PRE_MATCH_COUNTDOWN: 5,          // Seconds countdown before match starts
+  BETWEEN_ROUNDS_DELAY: 3,         // Seconds delay after round result before next question
+  POST_MATCH_DELAY: 3,             // Seconds before winners get paired for next match
+};
+
 // ─── Tournament Registration System ──────────────────────────────────────────
 // Players enter username before tournament, wait until admin starts, then all play
 const registeredPlayers = new Map(); // deviceId → { username, deviceId, joinedAt, socketId }
@@ -195,6 +204,7 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
       round,
       totalQuestions: match.questions?.length || questionsPerMatch,
       isTournament: true,
+      preMatchCountdown: TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN, // Tell clients to show countdown
     };
 
     if (s1) { 
@@ -214,10 +224,14 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
       }); 
     }
 
-    // Start server-driven timer for the match
-    startMatchTimer(match);
+    // Start server-driven timer AFTER pre-match countdown
+    setTimeout(() => {
+      if (match.active) {
+        startMatchTimer(match);
+      }
+    }, TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN * 1000);
 
-    console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId} (${questionsPerMatch} questions)`);
+    console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId} (${questionsPerMatch} questions, ${TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN}s countdown)`);
   }
 
   // Odd player out → automatic bye (advances to next round)
@@ -372,6 +386,7 @@ function tryPairWinners(completedRound) {
         round: nextRound,
         totalQuestions: match.questions?.length || questionsPerMatch,
         isTournament: true,
+        preMatchCountdown: TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN,
       };
 
       const s1 = io.sockets.sockets.get(p1.socketId);
@@ -394,8 +409,12 @@ function tryPairWinners(completedRound) {
         });
       }
 
-      // Start server-driven timer for the match
-      startMatchTimer(match);
+      // Start server-driven timer AFTER pre-match countdown
+      setTimeout(() => {
+        if (match.active) {
+          startMatchTimer(match);
+        }
+      }, TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN * 1000);
 
       console.log(`[instant-winner-pair] R${nextRound}: ${p1.username} vs ${p2.username} → ${match.matchId}`);
       broadcastToSpectators('match_started', {
@@ -429,10 +448,10 @@ function tryPairWinners(completedRound) {
 
 // NEW: Server-driven match timer
 function startMatchTimer(match) {
-  const QUESTION_TIME_MS = 10000; // 10 seconds per question
+  const QUESTION_TIME_MS = TOURNAMENT_PACING.QUESTION_TIME_SECONDS * 1000;
   const COUNTDOWN_INTERVAL_MS = 1000; // emit countdown every second
 
-  let timeLeft = 10;
+  let timeLeft = TOURNAMENT_PACING.QUESTION_TIME_SECONDS;
   match.questionStartTime = Date.now();
 
   const countdownInterval = setInterval(() => {
@@ -455,7 +474,7 @@ function startMatchTimer(match) {
       for (const player of players) {
         if (player.answer === null && match.active) {
           player.answer = null; // explicit timeout
-          player.answerTime = 10;
+          player.answerTime = TOURNAMENT_PACING.QUESTION_TIME_SECONDS;
           needsEval = true;
         }
       }
@@ -694,10 +713,11 @@ function startTournament() {
   const connectedPlayers = allPlayers.filter(p => {
     if (!p.socketId) return false;
     const socket = io.sockets.sockets.get(p.socketId);
-    console.log(socket, "The users socket id");
-    console.log(socket.connected, "The users socket id connected");
-    
-    return socket && socket.connected;
+    const isConnected = socket && socket.connected;
+    if (!isConnected) {
+      console.log(`[tournament] ${p.username} registered but socket disconnected`);
+    }
+    return isConnected;
   });
 
   console.log(`[tournament] ${allPlayers.length} registered, ${connectedPlayers.length} connected`);
@@ -2421,7 +2441,21 @@ app.get('/admin/tournament/debug', (_, res) => {
     registeredCount: registeredPlayers.size,
     activeCount: getActivePlayerCount(),
     autoStartRetryCount,
+    pacing: TOURNAMENT_PACING,
   });
+});
+
+// Admin: Update tournament pacing settings
+app.post('/admin/tournament/pacing', (req, res) => {
+  const { questionTime, preMatchCountdown, betweenRoundsDelay, postMatchDelay } = req.body;
+  
+  if (questionTime !== undefined) TOURNAMENT_PACING.QUESTION_TIME_SECONDS = Math.max(5, Math.min(30, questionTime));
+  if (preMatchCountdown !== undefined) TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN = Math.max(0, Math.min(30, preMatchCountdown));
+  if (betweenRoundsDelay !== undefined) TOURNAMENT_PACING.BETWEEN_ROUNDS_DELAY = Math.max(0, Math.min(10, betweenRoundsDelay));
+  if (postMatchDelay !== undefined) TOURNAMENT_PACING.POST_MATCH_DELAY = Math.max(0, Math.min(10, postMatchDelay));
+  
+  console.log('[admin] Tournament pacing updated:', TOURNAMENT_PACING);
+  res.json({ ok: true, pacing: TOURNAMENT_PACING });
 });
 
 // Admin: Start the tournament (begin pairing)
