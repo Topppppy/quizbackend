@@ -710,16 +710,23 @@ function startTournament() {
 
   // Only include players who have an active socket connection
   const allPlayers = [...registeredPlayers.values()];
+  const disconnectedNames = [];
   const connectedPlayers = allPlayers.filter(p => {
-    if (!p.socketId) return false;
+    if (!p.socketId) {
+      disconnectedNames.push(p.username);
+      return false;
+    }
     const socket = io.sockets.sockets.get(p.socketId);
     const isConnected = socket && socket.connected;
     if (!isConnected) {
-      console.log(`[tournament] ${p.username} registered but socket disconnected`);
+      disconnectedNames.push(p.username);
     }
     return isConnected;
   });
 
+  if (disconnectedNames.length > 0) {
+    console.log(`[tournament] ⚠️ Disconnected players: ${disconnectedNames.join(', ')}`);
+  }
   console.log(`[tournament] ${allPlayers.length} registered, ${connectedPlayers.length} connected`);
 
   if (connectedPlayers.length < 2) {
@@ -820,45 +827,96 @@ function scheduleAutoStart(scheduledDate) {
 // Attempt to start tournament with retry logic
 let autoStartRetryCount = 0;
 const MAX_AUTO_START_RETRIES = 6; // Retry for up to 30 seconds (6 x 5s)
+const GRACE_PERIOD_SECONDS = 10; // Wait 10s after min players reached to let more join
+let gracePeriodTimer = null;
+let gracePeriodStartCount = 0;
 
 function attemptTournamentStart() {
+  const activeCount = getActivePlayerCount();
+  const registeredCount = registeredPlayers.size;
+  
+  // If we have enough players but grace period hasn't started, start it
+  if (activeCount >= 2 && !gracePeriodTimer) {
+    gracePeriodStartCount = activeCount;
+    console.log(`[tournament] ✅ ${activeCount} players ready! Starting ${GRACE_PERIOD_SECONDS}s grace period for more players to join...`);
+    
+    io.emit('tournament_grace_period', {
+      message: `${activeCount} players ready! Starting in ${GRACE_PERIOD_SECONDS} seconds...`,
+      registeredCount,
+      activeCount,
+      secondsRemaining: GRACE_PERIOD_SECONDS,
+    });
+    
+    // Countdown during grace period
+    let remaining = GRACE_PERIOD_SECONDS;
+    gracePeriodTimer = setInterval(() => {
+      remaining--;
+      if (remaining > 0 && remaining <= 5) {
+        io.emit('tournament_countdown', { 
+          message: `Starting in ${remaining}...`, 
+          secondsRemaining: remaining 
+        });
+        console.log(`[tournament] ⏱️ Grace period: ${remaining}s remaining (${getActivePlayerCount()} players)`);
+      }
+      if (remaining <= 0) {
+        clearInterval(gracePeriodTimer);
+        gracePeriodTimer = null;
+        // Now actually start
+        const finalCount = getActivePlayerCount();
+        console.log(`[tournament] Grace period ended. Starting with ${finalCount} players (was ${gracePeriodStartCount} at start)`);
+        doActualTournamentStart();
+      }
+    }, 1000);
+    return;
+  }
+  
+  // If grace period is already running, don't do anything - let it complete
+  if (gracePeriodTimer) {
+    return;
+  }
+  
+  // Not enough players yet
+  console.log(`[tournament] Auto-start attempt ${autoStartRetryCount + 1} failed: Need at least 2 registered players`);
+  console.log(`[tournament] State: ${registeredCount} registered, ${activeCount} active`);
+  
+  if (autoStartRetryCount < MAX_AUTO_START_RETRIES) {
+    autoStartRetryCount++;
+    console.log(`[tournament] Retrying in 5 seconds... (attempt ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES})`);
+    
+    io.emit('tournament_auto_start_pending', {
+      message: `Waiting for players... Retry ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES}`,
+      registeredCount,
+      activeCount,
+      retryIn: 5,
+    });
+    
+    setTimeout(() => {
+      attemptTournamentStart();
+    }, 5000);
+  } else {
+    // Give up after max retries
+    autoStartRetryCount = 0;
+    console.log(`[tournament] Auto-start failed after ${MAX_AUTO_START_RETRIES} retries`);
+    
+    io.emit('tournament_auto_start_failed', { 
+      error: 'Not enough players',
+      message: `Tournament could not start: Not enough players. Please try again.`,
+      registeredCount,
+      activeCount,
+    });
+  }
+}
+
+function doActualTournamentStart() {
   const result = startTournament();
   
   if (result.error) {
-    console.log(`[tournament] Auto-start attempt ${autoStartRetryCount + 1} failed: ${result.error}`);
-    
-    // Log current state for debugging
-    console.log(`[tournament] State: ${registeredPlayers.size} registered, ${getActivePlayerCount()} active`);
-    
-    // If not enough players and we haven't retried too many times, retry in 5 seconds
-    if (autoStartRetryCount < MAX_AUTO_START_RETRIES) {
-      autoStartRetryCount++;
-      console.log(`[tournament] Retrying in 5 seconds... (attempt ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES})`);
-      
-      io.emit('tournament_auto_start_pending', {
-        message: `Waiting for players... Retry ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES}`,
-        registeredCount: registeredPlayers.size,
-        activeCount: getActivePlayerCount(),
-        retryIn: 5,
-      });
-      
-      setTimeout(() => {
-        attemptTournamentStart();
-      }, 5000);
-    } else {
-      // Give up after max retries
-      autoStartRetryCount = 0;
-      console.log(`[tournament] Auto-start failed after ${MAX_AUTO_START_RETRIES} retries`);
-      
-      io.emit('tournament_auto_start_failed', { 
-        error: result.error,
-        message: `Tournament could not start: ${result.error}. Please try starting manually.`,
-        registeredCount: registeredPlayers.size,
-        activeCount: getActivePlayerCount(),
-      });
-    }
+    console.log(`[tournament] Start failed after grace period: ${result.error}`);
+    io.emit('tournament_auto_start_failed', { 
+      error: result.error,
+      message: `Tournament could not start: ${result.error}`,
+    });
   } else {
-    // Success!
     autoStartRetryCount = 0;
     console.log(`[tournament] ✅ Auto-start successful!`);
   }
