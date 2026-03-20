@@ -727,14 +727,19 @@ function scheduleAutoStart(scheduledDate) {
   }
 
   const startTime = new Date(scheduledDate).getTime();
-  const delay = startTime - Date.now();
+  const now = Date.now();
+  const delay = startTime - now;
+
+  console.log(`[tournament] scheduleAutoStart called:`);
+  console.log(`  - Scheduled: ${scheduledDate}`);
+  console.log(`  - Server now: ${new Date(now).toISOString()}`);
+  console.log(`  - Delay: ${Math.round(delay / 1000)}s (${Math.round(delay / 60000)} min)`);
 
   if (delay <= 0) {
     // Time already passed — start immediately if possible
     console.log('[tournament] Scheduled time already passed — auto-starting now');
     io.emit('tournament_countdown', { secondsRemaining: 0, message: 'Tournament starting NOW!' });
-    const result = startTournament();
-    if (result.error) console.log(`[tournament] Auto-start failed: ${result.error}`);
+    attemptTournamentStart();
     return;
   }
 
@@ -760,22 +765,59 @@ function scheduleAutoStart(scheduledDate) {
     }
   });
 
-  console.log(`[tournament] Auto-start scheduled in ${Math.round(delay / 1000)}s (${scheduledDate})`);
+  console.log(`[tournament] ✅ Auto-start timer SET — will fire in ${Math.round(delay / 1000)}s`);
   autoStartTimer = setTimeout(() => {
-    console.log('[tournament] ⏰ Auto-starting tournament now!');
+    console.log('[tournament] ⏰ Auto-start timer FIRED! Starting tournament...');
     io.emit('tournament_countdown', { secondsRemaining: 0, message: 'Tournament starting NOW!' });
-    const result = startTournament();
-    if (result.error) {
-      console.log(`[tournament] Auto-start failed: ${result.error}`);
-      // Notify all clients that auto-start failed
+    attemptTournamentStart();
+  }, delay);
+}
+
+// Attempt to start tournament with retry logic
+let autoStartRetryCount = 0;
+const MAX_AUTO_START_RETRIES = 6; // Retry for up to 30 seconds (6 x 5s)
+
+function attemptTournamentStart() {
+  const result = startTournament();
+  
+  if (result.error) {
+    console.log(`[tournament] Auto-start attempt ${autoStartRetryCount + 1} failed: ${result.error}`);
+    
+    // Log current state for debugging
+    console.log(`[tournament] State: ${registeredPlayers.size} registered, ${getActivePlayerCount()} active`);
+    
+    // If not enough players and we haven't retried too many times, retry in 5 seconds
+    if (autoStartRetryCount < MAX_AUTO_START_RETRIES) {
+      autoStartRetryCount++;
+      console.log(`[tournament] Retrying in 5 seconds... (attempt ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES})`);
+      
+      io.emit('tournament_auto_start_pending', {
+        message: `Waiting for players... Retry ${autoStartRetryCount}/${MAX_AUTO_START_RETRIES}`,
+        registeredCount: registeredPlayers.size,
+        activeCount: getActivePlayerCount(),
+        retryIn: 5,
+      });
+      
+      setTimeout(() => {
+        attemptTournamentStart();
+      }, 5000);
+    } else {
+      // Give up after max retries
+      autoStartRetryCount = 0;
+      console.log(`[tournament] Auto-start failed after ${MAX_AUTO_START_RETRIES} retries`);
+      
       io.emit('tournament_auto_start_failed', { 
         error: result.error,
-        message: `Tournament could not auto-start: ${result.error}`,
+        message: `Tournament could not start: ${result.error}. Please try starting manually.`,
         registeredCount: registeredPlayers.size,
         activeCount: getActivePlayerCount(),
       });
     }
-  }, delay);
+  } else {
+    // Success!
+    autoStartRetryCount = 0;
+    console.log(`[tournament] ✅ Auto-start successful!`);
+  }
 }
 
 // ─── Security helpers ─────────────────────────────────────────────────────────
@@ -2187,6 +2229,26 @@ app.get('/admin/tournament/players', (_, res) => {
   });
 });
 
+// Debug: Check tournament timer status
+app.get('/admin/tournament/debug', (_, res) => {
+  const now = Date.now();
+  const scheduledTime = tournamentConfig.scheduledDate ? new Date(tournamentConfig.scheduledDate).getTime() : null;
+  const timeUntilStart = scheduledTime ? scheduledTime - now : null;
+  
+  res.json({
+    serverTime: new Date(now).toISOString(),
+    scheduledDate: tournamentConfig.scheduledDate,
+    tournamentStarted: tournamentConfig.tournamentStarted,
+    autoStartTimerActive: autoStartTimer !== null,
+    timeUntilStartMs: timeUntilStart,
+    timeUntilStartSeconds: timeUntilStart ? Math.round(timeUntilStart / 1000) : null,
+    timeUntilStartMinutes: timeUntilStart ? Math.round(timeUntilStart / 60000) : null,
+    registeredCount: registeredPlayers.size,
+    activeCount: getActivePlayerCount(),
+    autoStartRetryCount,
+  });
+});
+
 // Admin: Start the tournament (begin pairing)
 app.post('/admin/tournament/start', (req, res) => {
   if (!tournamentConfig.scheduledDate) {
@@ -2493,28 +2555,58 @@ app.post('/admin/demo/stop', (req, res) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000;
 
-async function startServer() {
+let mongoConnected = false;
+
+async function connectMongo(retryCount = 0) {
+  const maxRetries = 5;
   try {
     await mongoose.connect(process.env.MONGO_URI);
+    mongoConnected = true;
     console.log('✅ Connected to MongoDB');
 
     // Load persisted tournament schedule from MongoDB on startup
-    const savedSchedule = await TournamentSchedule.findOne({ status: 'scheduled' });
-    if (savedSchedule && savedSchedule.scheduledDate) {
-      const isoDate = savedSchedule.scheduledDate.toISOString();
-      tournamentConfig.scheduledDate = isoDate;
-      tournamentConfig.tournamentStarted = false;
-      console.log(`✅ Loaded tournament schedule from DB: ${isoDate}`);
+    try {
+      const savedSchedule = await TournamentSchedule.findOne({ status: 'scheduled' });
+      if (savedSchedule && savedSchedule.scheduledDate) {
+        const isoDate = savedSchedule.scheduledDate.toISOString();
+        tournamentConfig.scheduledDate = isoDate;
+        tournamentConfig.tournamentStarted = false;
+        console.log(`✅ Loaded tournament schedule from DB: ${isoDate}`);
 
-      // Re-schedule auto-start if the time hasn't passed yet
-      scheduleAutoStart(isoDate);
+        // Re-schedule auto-start if the time hasn't passed yet
+        scheduleAutoStart(isoDate);
+      }
+    } catch (scheduleErr) {
+      console.error('⚠️ Could not load tournament schedule:', scheduleErr.message);
     }
-
-    server.listen(PORT, () => console.log(`\n🚀 QuizDuel server listening on http://localhost:${PORT}\n`));
+    
+    return true;
   } catch (err) {
-    console.error('❌ MongoDB connection error:', err);
-    process.exit(1);
+    console.error(`❌ MongoDB connection error (attempt ${retryCount + 1}/${maxRetries}):`, err.message);
+    
+    if (retryCount < maxRetries - 1) {
+      console.log(`   Retrying in 5 seconds...`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return connectMongo(retryCount + 1);
+    }
+    
+    console.error('❌ MongoDB connection failed after max retries. Server will run without DB.');
+    return false;
   }
+}
+
+async function startServer() {
+  // Try to connect to MongoDB, but don't fail if it doesn't work
+  await connectMongo();
+
+  server.listen(PORT, () => {
+    console.log(`\n🚀 QuizDuel server listening on http://localhost:${PORT}`);
+    if (!mongoConnected) {
+      console.log('⚠️  Running without MongoDB - some features may be limited\n');
+    } else {
+      console.log('');
+    }
+  });
 }
 
 startServer();
