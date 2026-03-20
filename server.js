@@ -27,8 +27,15 @@ const io = new Server(server, {
   },
   // Prevent clients from hammering with huge payloads
   maxHttpBufferSize: 1e4,   // 10 KB max per message
-  pingTimeout: 20000,
-  pingInterval: 10000,
+  // Increased timeouts for mobile networks
+  pingTimeout: 30000,       // 30s before considering disconnected
+  pingInterval: 15000,      // 15s ping interval
+  // Allow polling fallback for restrictive networks
+  transports: ['websocket', 'polling'],
+  // Upgrade timeout for slow connections
+  upgradeTimeout: 30000,
+  // Allow reconnection
+  allowUpgrades: true,
 });
 
 app.use(cors());
@@ -1220,6 +1227,72 @@ io.on('connection', (socket) => {
     socket.data.deviceId = deviceId;
     socket.data.sessionToken = sessionToken;
     devices.set(deviceId, socket.id);
+    
+    // ── AUTO-RECONNECT: Restore player to active match if they had one ──
+    // Check if player is in an active match and restore their connection
+    for (const [matchId, match] of matches) {
+      if (match.players[deviceId] && match.active) {
+        const player = match.players[deviceId];
+        const oldSocketId = player.socketId;
+        
+        // Update socketId to new connection
+        player.socketId = socket.id;
+        player.connected = true;
+        player.disconnectedAt = null;
+        
+        // Re-join the match room
+        socket.join(matchId);
+        
+        // Update registered players if this is a tournament
+        const registered = registeredPlayers.get(deviceId);
+        if (registered) {
+          registered.socketId = socket.id;
+        }
+        
+        // Also update winners queue if present
+        const queueEntry = winnersQueue.get(deviceId);
+        if (queueEntry) {
+          queueEntry.socketId = socket.id;
+        }
+        
+        console.log(`[reconnect] ${player.username} reconnected to match ${matchId} (old: ${oldSocketId}, new: ${socket.id})`);
+        
+        // Send current match state back to the reconnected player
+        const opponent = Object.values(match.players).find(p => p.deviceId !== deviceId);
+        socket.emit('match_reconnected', {
+          matchId,
+          matchSeed: match.seed,
+          questions: match.questions,
+          questionIndex: match.questionIndex,
+          totalQuestions: match.questions?.length || 5,
+          currentQuestion: match.questions?.[match.questionIndex] || null,
+          round: match.tournamentRound || 1,
+          opponent: opponent ? { username: opponent.username, deviceId: opponent.deviceId } : null,
+          myAnswer: player.answer,
+          timeLeft: match.questionStartTime 
+            ? Math.max(0, 10 - Math.floor((Date.now() - match.questionStartTime) / 1000))
+            : 10,
+          isTournament: !!match.tournamentRound,
+        });
+        
+        // Notify opponent that player reconnected
+        if (opponent) {
+          const oppSocket = io.sockets.sockets.get(opponent.socketId);
+          if (oppSocket) {
+            oppSocket.emit('opponent_reconnected', { matchId });
+          }
+        }
+        
+        break; // Found the match, stop searching
+      }
+    }
+    
+    // Also restore tournament registration status
+    const registered = registeredPlayers.get(deviceId);
+    if (registered && !tournamentConfig.tournamentStarted) {
+      registered.socketId = socket.id;
+      console.log(`[reconnect] ${registered.username} restored to tournament registration`);
+    }
   });
 
   // ── Request current state sync (reconnection / visibility change) ──────
@@ -2324,6 +2397,97 @@ app.get('/api/check-joined/:deviceId', (req, res) => {
     username: playerInfo?.username || null,
     joinedAt: playerInfo?.joinedAt || null
   });
+});
+
+// ─── POLLING FALLBACK: Get current match/tournament state for a device ───────
+// Clients can poll this every 2-3 seconds as a fallback when WebSocket fails
+app.get('/api/state/:deviceId', (req, res) => {
+  const { deviceId } = req.params;
+  
+  // Find if player is in an active match
+  let matchState = null;
+  for (const [matchId, match] of matches) {
+    if (match.players[deviceId] && match.active) {
+      const myPlayer = match.players[deviceId];
+      const opponent = Object.values(match.players).find(p => p.deviceId !== deviceId);
+      matchState = {
+        matchId,
+        questionIndex: match.questionIndex,
+        totalQuestions: match.questions?.length || 5,
+        currentQuestion: match.questions?.[match.questionIndex] || null,
+        myAnswer: myPlayer.answer,
+        opponentHasAnswered: opponent?.answer !== null,
+        round: match.tournamentRound || 1,
+        timeLeft: match.questionStartTime 
+          ? Math.max(0, 10 - Math.floor((Date.now() - match.questionStartTime) / 1000))
+          : 10,
+      };
+      break;
+    }
+  }
+  
+  // Get player registration status
+  const registered = registeredPlayers.get(deviceId);
+  const isInWinnersQueue = winnersQueue.has(deviceId);
+  const isInWaitingQueue = waitingQueue.has(deviceId);
+  const isInMatch = playersInMatch.has(deviceId);
+  
+  res.json({
+    serverTime: Date.now(),
+    tournamentStarted: tournamentConfig.tournamentStarted,
+    scheduledDate: tournamentConfig.scheduledDate,
+    registered: !!registered,
+    username: registered?.username || null,
+    status: matchState ? 'in_match' 
+          : isInWinnersQueue ? 'waiting_next_round'
+          : isInWaitingQueue ? 'waiting_match'
+          : registered ? 'registered'
+          : 'not_registered',
+    match: matchState,
+    currentRound,
+    registeredCount: registeredPlayers.size,
+    activeCount: getActivePlayerCount(),
+  });
+});
+
+// ─── POLLING: Submit answer via REST (fallback when socket fails) ────────────
+app.post('/api/answer', (req, res) => {
+  const { deviceId, matchId, answer, questionIndex } = req.body;
+  
+  if (!deviceId || !matchId || answer === undefined) {
+    return res.status(400).json({ error: 'Missing required fields' });
+  }
+  
+  const match = matches.get(matchId);
+  if (!match || !match.active) {
+    return res.status(404).json({ error: 'Match not found or inactive' });
+  }
+  
+  const player = match.players[deviceId];
+  if (!player) {
+    return res.status(403).json({ error: 'Not a player in this match' });
+  }
+  
+  // Check if already answered
+  if (player.answer !== null) {
+    return res.json({ ok: true, alreadyAnswered: true });
+  }
+  
+  // Record answer
+  const now = Date.now();
+  const elapsed = match.questionStartTime ? (now - match.questionStartTime) / 1000 : 0;
+  player.answer = answer;
+  player.answerTime = Math.min(elapsed, 10);
+  
+  console.log(`[REST answer] ${player.username} answered ${answer} in ${player.answerTime.toFixed(2)}s`);
+  
+  // Check if both answered
+  const [p1, p2] = Object.values(match.players);
+  if (p1.answer !== null && p2.answer !== null) {
+    evaluateRound(match, io);
+  }
+  
+  res.json({ ok: true, recorded: true });
 });
 
 // Admin: Reset tournament (clear schedule + all registrations → back to normal mode)
