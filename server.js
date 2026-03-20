@@ -1134,6 +1134,7 @@ function sendViewState(socket) {
     matches: matchesToView(),
     players: getLeaderboardArray(),
     lobbyCount: lobby.size,
+    registeredCount: registeredPlayers.size,
   });
 }
 
@@ -2287,7 +2288,7 @@ app.post('/api/users', async (req, res) => {
         leaderboard.set(username, { username, wins: 0, stage: 'waiting' });
       }
 
-      broadcastToSpectators('player_joined', { username, waitingCount: registeredPlayers.size });
+      broadcastToSpectators('player_joined', { username, lobbyCount: registeredPlayers.size, waitingCount: registeredPlayers.size });
       io.emit('waiting_count', { count: registeredPlayers.size });
 
       console.log(`[tournament] ${username} registered via REST (${registeredPlayers.size} total)`);
