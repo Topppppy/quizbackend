@@ -247,6 +247,15 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
   }
 
   broadcastToSpectators('round_started', { round, matchCount: matchPairs.length });
+  // Broadcast each match individually so ViewScreen can display them
+  for (const mp of matchPairs) {
+    broadcastToSpectators('match_started', {
+      matchId: mp.matchId,
+      round: mp.round,
+      p1: mp.p1,
+      p2: mp.p2,
+    });
+  }
   io.emit('tournament_round_started', { round, matchCount: matchPairs.length, playerCount: players.length });
   return matchPairs;
 }
@@ -1106,6 +1115,7 @@ function broadcastLeaderboard() {
 function matchesToView() {
   const result = {};
   for (const [id, m] of matches) {
+    if (!m.active) continue; // Only show active matches
     result[id] = {
       matchId: m.matchId,
       players: Object.fromEntries(
@@ -1972,6 +1982,11 @@ function evaluateRound(match, io) {
       if (!matchOver) {
         p1Result = 'both_wrong';
         p2Result = 'both_wrong';
+        
+        // Save answers before resetting (needed for round_result emission)
+        const p1OrigAnswer = p1.answer;
+        const p2OrigAnswer = p2.answer;
+        
         match.questionIndex++;
         match.questionStartTime = Date.now();
         
@@ -1994,16 +2009,16 @@ function evaluateRound(match, io) {
           isTournament: true,
         };
         
-        // First emit round_result so players see red highlight, then send next question after a delay
-        const emitBothWrong = (player) => {
+        // Emit round_result so players see red highlight, then send next question after a delay
+        const emitBothWrong = (player, myOrigAnswer, oppOrigAnswer) => {
           const sock = io.sockets.sockets.get(player.socketId);
           if (sock) {
             sock.emit('round_result', {
               result: 'both_wrong',
               questionIndex: qIndex,
               correctAnswer: question.correct,
-              myAnswer: player.answer,
-              opponentAnswer: Object.values(match.players).find(p => p.deviceId !== player.deviceId).answer,
+              myAnswer: myOrigAnswer,
+              opponentAnswer: oppOrigAnswer,
               matchOver: false,
               isTournament: true,
             });
@@ -2013,8 +2028,8 @@ function evaluateRound(match, io) {
             }, 2000);
           }
         };
-        emitBothWrong(p1);
-        emitBothWrong(p2);
+        emitBothWrong(p1, p1OrigAnswer, p2OrigAnswer);
+        emitBothWrong(p2, p2OrigAnswer, p1OrigAnswer);
         
         broadcastToSpectators('both_wrong', {
           matchId: match.matchId,
@@ -2059,7 +2074,7 @@ function evaluateRound(match, io) {
     },
   });
 
-  // At this point, matchOver is always true (both_correct returns early above)
+  // At this point, matchOver is true (both_correct and tournament both_wrong return early above)
   const winner = p1Result === 'win' ? p1 : p2Result === 'win' ? p2 : null;
   const loser  = p1Result === 'lose' ? p1 : p2Result === 'lose' ? p2 : null;
 
