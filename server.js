@@ -1948,7 +1948,88 @@ function evaluateRound(match, io) {
     p1Result = 'lose'; p2Result = 'win'; matchOver = true;
   } else {
     // Both wrong
-    p1Result = 'gameover'; p2Result = 'gameover'; matchOver = true;
+    if (match.tournamentRound) {
+      // Tournament: give another question instead of eliminating both
+      match.bothWrongCount = (match.bothWrongCount || 0) + 1;
+      
+      // Check if we've exhausted all questions in current set
+      if (match.questionIndex >= match.questions.length - 1) {
+        const usedIds = new Set(match.questions.map(q => q.id));
+        const availableQuestions = BIBLE_QUESTIONS.filter(q => !usedIds.has(q.id));
+        
+        if (availableQuestions.length > 0) {
+          const newQuestions = seededShuffle(availableQuestions, match.matchId + '_bw_' + match.bothWrongCount)
+            .slice(0, 5);
+          match.questions = [...match.questions, ...newQuestions];
+          console.log(`[match] ${match.matchId} both wrong ${match.bothWrongCount}x — added ${newQuestions.length} more questions`);
+        } else {
+          // Truly exhausted all questions — eliminate both as absolute last resort
+          console.log(`[match] ${match.matchId} exhausted all ${BIBLE_QUESTIONS.length} questions — eliminating both`);
+          p1Result = 'gameover'; p2Result = 'gameover'; matchOver = true;
+        }
+      }
+      
+      if (!matchOver) {
+        p1Result = 'both_wrong';
+        p2Result = 'both_wrong';
+        match.questionIndex++;
+        match.questionStartTime = Date.now();
+        
+        // Reset answers
+        p1.answer = null; p1.answerTime = null;
+        p2.answer = null; p2.answerTime = null;
+        
+        // Restart server timer for next question
+        cleanupMatchTimer(match.matchId);
+        startMatchTimer(match);
+        
+        // Send the next question to both players
+        const nextQuestion = match.questions[match.questionIndex];
+        const nextQuestionPayload = {
+          questionIndex: match.questionIndex,
+          question: nextQuestion,
+          bothWrongCount: match.bothWrongCount,
+          totalQuestions: match.questions.length,
+          message: 'Both wrong! Try another question.',
+          isTournament: true,
+        };
+        
+        // First emit round_result so players see red highlight, then send next question after a delay
+        const emitBothWrong = (player) => {
+          const sock = io.sockets.sockets.get(player.socketId);
+          if (sock) {
+            sock.emit('round_result', {
+              result: 'both_wrong',
+              questionIndex: qIndex,
+              correctAnswer: question.correct,
+              myAnswer: player.answer,
+              opponentAnswer: Object.values(match.players).find(p => p.deviceId !== player.deviceId).answer,
+              matchOver: false,
+              isTournament: true,
+            });
+            // After 2s delay, send the next question
+            setTimeout(() => {
+              sock.emit('next_question', nextQuestionPayload);
+            }, 2000);
+          }
+        };
+        emitBothWrong(p1);
+        emitBothWrong(p2);
+        
+        broadcastToSpectators('both_wrong', {
+          matchId: match.matchId,
+          p1: p1.username,
+          p2: p2.username,
+          questionIndex: match.questionIndex,
+          bothWrongCount: match.bothWrongCount,
+        });
+        
+        return; // Exit early — match continues
+      }
+    } else {
+      // Non-tournament: both wrong ends the match
+      p1Result = 'gameover'; p2Result = 'gameover'; matchOver = true;
+    }
   }
 
   // Emit result to each player
@@ -2043,7 +2124,7 @@ function evaluateRound(match, io) {
         { $inc: { wins: 1 }, round: round + 1 }
       ).catch(e => console.error('[bracket] DB winner update error:', e.message));
     } else {
-      // Both wrong — update data immediately
+      // Both wrong AND all questions exhausted (extreme edge case) — eliminate both
       const lp1 = registeredPlayers.get(p1.deviceId);
       const lp2 = registeredPlayers.get(p2.deviceId);
       if (lp1) lp1.status = 'eliminated';
@@ -2083,8 +2164,8 @@ function evaluateRound(match, io) {
           round
         );
       } else {
-        // Both wrong — notify both players
-        console.log(`[tournament R${round}] Both wrong — eliminating ${p1.username} and ${p2.username}`);
+        // Both wrong AND all questions exhausted — eliminate both (extreme edge case)
+        console.log(`[tournament R${round}] Both wrong & all questions exhausted — eliminating ${p1.username} and ${p2.username}`);
         const s1 = io.sockets.sockets.get(p1.socketId);
         const s2 = io.sockets.sockets.get(p2.socketId);
         if (s1) s1.emit('tournament_eliminated', {
