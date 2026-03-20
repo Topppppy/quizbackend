@@ -56,6 +56,22 @@ let specialSession = { active: true, questions: [] };
 // Required lobby size for special session (normal sessions pair immediately)
 const SPECIAL_LOBBY_REQUIRED = 10;
 
+// ─── NEW: Dedicated Queues for Real-Time Matchmaking ─────────────────────────
+// waitingQueue: players waiting to be matched for the FIRST time in a round
+// winnersQueue: players who WON their match, waiting to be paired with another winner
+// Key: deviceId → { deviceId, username, socketId, round, queuedAt, wins }
+const waitingQueue = new Map();
+const winnersQueue = new Map();
+
+// Matchmaking lock to prevent race conditions
+let matchmakingLock = false;
+
+// Track which players are currently IN an active match (prevents double-queueing)
+const playersInMatch = new Set(); // deviceIds of players currently in a match
+
+// Server-driven match timers: matchId → { timer, currentQuestion, questionStartTime }
+const matchTimers = new Map();
+
 // ─── Tournament Registration System ──────────────────────────────────────────
 // Players enter username before tournament, wait until admin starts, then all play
 const registeredPlayers = new Map(); // deviceId → { username, deviceId, joinedAt, socketId }
@@ -128,6 +144,22 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
     const p1 = players[i];
     const p2 = players[i + 1];
 
+    // ATOMIC: Check they're not already in a match
+    if (playersInMatch.has(p1.deviceId) || playersInMatch.has(p2.deviceId)) {
+      console.log(`[pairPlayersForRound] Skipping already-in-match players: ${p1.username} or ${p2.username}`);
+      continue;
+    }
+
+    // Mark as in match BEFORE creating
+    playersInMatch.add(p1.deviceId);
+    playersInMatch.add(p2.deviceId);
+
+    // Remove from any queues
+    waitingQueue.delete(p1.deviceId);
+    waitingQueue.delete(p2.deviceId);
+    winnersQueue.delete(p1.deviceId);
+    winnersQueue.delete(p2.deviceId);
+
     const match = createMatch(
       { deviceId: p1.deviceId, username: p1.username, socketId: p1.socketId },
       { deviceId: p2.deviceId, username: p2.username, socketId: p2.socketId },
@@ -174,6 +206,9 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
       }); 
     }
 
+    // Start server-driven timer for the match
+    startMatchTimer(match);
+
     console.log(`[tournament R${round}] Paired: ${p1.username} vs ${p2.username} → ${match.matchId} (${questionsPerMatch} questions)`);
   }
 
@@ -198,18 +233,24 @@ function queueWinnerForNextRound(player, round) {
   if (!bracketWinners.has(round)) bracketWinners.set(round, []);
   bracketWinners.get(round).push(player);
 
+  // ALSO add to winnersQueue for instant re-matching
+  if (!winnersQueue.has(player.deviceId) && !playersInMatch.has(player.deviceId)) {
+    winnersQueue.set(player.deviceId, {
+      deviceId: player.deviceId,
+      username: player.username,
+      socketId: player.socketId,
+      round: round + 1,
+      queuedAt: Date.now(),
+      wins: player.wins || 1,
+    });
+    console.log(`[winnersQueue] ${player.username} added (${winnersQueue.size} waiting)`);
+  }
+
   const waitingWinners = bracketWinners.get(round);
   console.log(`[bracket R${round}] ${player.username} queued (${waitingWinners.length} waiting)`);
 
-  // Check if we have enough winners to start next round (≥2) and no active matches remain for this round
-  const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
-  if (activeRoundMatches.length === 0 && waitingWinners.length >= 2) {
-    advanceToNextRound(round);
-  } else if (activeRoundMatches.length === 0 && waitingWinners.length === 1) {
-    // Only one player left in the whole tournament — they are the champion!
-    const champion = waitingWinners[0];
-    declareTournamentChampion(champion);
-  }
+  // TRY INSTANT WINNER PAIRING: if we have 2+ winners, pair them immediately
+  tryPairWinners(round);
 }
 
 // Advance all waiting winners into the next round
@@ -247,6 +288,349 @@ function advanceToNextRound(completedRound) {
   io.emit('tournament_next_round', { round: nextRound, playerCount: connectedAdvancers.length, questionsPerMatch });
   pairPlayersForRound(connectedAdvancers, nextRound, questionsPerMatch);
 }
+
+// NEW: Try to pair winners INSTANTLY when they become available
+function tryPairWinners(completedRound) {
+  if (matchmakingLock) {
+    console.log(`[tryPairWinners] Matchmaking locked, will retry shortly`);
+    setTimeout(() => tryPairWinners(completedRound), 100);
+    return;
+  }
+
+  matchmakingLock = true;
+  const nextRound = completedRound + 1;
+
+  try {
+    // Get all connected winners from the winnersQueue
+    const availableWinners = [];
+    for (const [deviceId, player] of winnersQueue) {
+      // Skip if player is already in a match
+      if (playersInMatch.has(deviceId)) {
+        winnersQueue.delete(deviceId);
+        continue;
+      }
+      // Verify socket is still connected
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (socket && socket.connected) {
+        availableWinners.push(player);
+      } else {
+        // Ghost user — remove from queue
+        winnersQueue.delete(deviceId);
+        console.log(`[winnersQueue] Removed ghost: ${player.username}`);
+      }
+    }
+
+    console.log(`[tryPairWinners] ${availableWinners.length} winners available for pairing`);
+
+    // Pair winners in pairs of 2
+    while (availableWinners.length >= 2) {
+      const p1 = availableWinners.shift();
+      const p2 = availableWinners.shift();
+
+      // Remove from winnersQueue ATOMICALLY
+      winnersQueue.delete(p1.deviceId);
+      winnersQueue.delete(p2.deviceId);
+
+      // Also remove from bracketWinners to prevent double-processing
+      const bracket = bracketWinners.get(completedRound) || [];
+      const filteredBracket = bracket.filter(p => p.deviceId !== p1.deviceId && p.deviceId !== p2.deviceId);
+      if (filteredBracket.length > 0) {
+        bracketWinners.set(completedRound, filteredBracket);
+      } else {
+        bracketWinners.delete(completedRound);
+      }
+
+      // Mark as in match
+      playersInMatch.add(p1.deviceId);
+      playersInMatch.add(p2.deviceId);
+
+      // Calculate questions
+      const questionsPerMatch = getQuestionsPerMatch(winnersQueue.size + availableWinners.length + 2);
+
+      // Create match
+      const match = createMatch(
+        { deviceId: p1.deviceId, username: p1.username, socketId: p1.socketId },
+        { deviceId: p2.deviceId, username: p2.username, socketId: p2.socketId },
+        true, // Bible quiz for tournament
+        questionsPerMatch
+      );
+      match.tournamentRound = nextRound;
+
+      // Emit to players
+      const basePayload = {
+        matchId: match.matchId,
+        matchSeed: match.seed,
+        questions: match.questions,
+        round: nextRound,
+        totalQuestions: match.questions?.length || questionsPerMatch,
+        isTournament: true,
+      };
+
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+
+      if (s1) {
+        s1.join(match.matchId);
+        s1.emit('match_found', {
+          ...basePayload,
+          you: { username: p1.username, deviceId: p1.deviceId },
+          opponent: { username: p2.username, deviceId: p2.deviceId },
+        });
+      }
+      if (s2) {
+        s2.join(match.matchId);
+        s2.emit('match_found', {
+          ...basePayload,
+          you: { username: p2.username, deviceId: p2.deviceId },
+          opponent: { username: p1.username, deviceId: p1.deviceId },
+        });
+      }
+
+      // Start server-driven timer for the match
+      startMatchTimer(match);
+
+      console.log(`[instant-winner-pair] R${nextRound}: ${p1.username} vs ${p2.username} → ${match.matchId}`);
+      broadcastToSpectators('match_started', {
+        matchId: match.matchId,
+        round: nextRound,
+        p1: { username: p1.username, deviceId: p1.deviceId },
+        p2: { username: p2.username, deviceId: p2.deviceId },
+      });
+    }
+
+    // Check if only 1 winner remains and no active matches
+    if (availableWinners.length === 1) {
+      const activeMatches = [...matches.values()].filter(m => m.tournamentRound && m.active);
+      if (activeMatches.length === 0) {
+        // This is the champion!
+        const champion = availableWinners[0];
+        winnersQueue.delete(champion.deviceId);
+        declareTournamentChampion(champion);
+      } else {
+        // Wait for other matches to complete
+        console.log(`[tryPairWinners] 1 winner waiting, ${activeMatches.length} matches still active`);
+      }
+    }
+  } finally {
+    matchmakingLock = false;
+  }
+}
+
+// NEW: Server-driven match timer
+function startMatchTimer(match) {
+  const QUESTION_TIME_MS = 10000; // 10 seconds per question
+  const COUNTDOWN_INTERVAL_MS = 1000; // emit countdown every second
+
+  let timeLeft = 10;
+  match.questionStartTime = Date.now();
+
+  const countdownInterval = setInterval(() => {
+    timeLeft--;
+    
+    // Emit countdown to both players
+    io.to(match.matchId).emit('timer_tick', {
+      matchId: match.matchId,
+      timeLeft,
+      questionIndex: match.questionIndex,
+    });
+
+    if (timeLeft <= 0) {
+      clearInterval(countdownInterval);
+      
+      // Force timeout for any player who hasn't answered
+      const players = Object.values(match.players);
+      let needsEval = false;
+      
+      for (const player of players) {
+        if (player.answer === null && match.active) {
+          player.answer = null; // explicit timeout
+          player.answerTime = 10;
+          needsEval = true;
+        }
+      }
+
+      // Evaluate if both have now answered (either by submission or timeout)
+      if (needsEval && players.every(p => p.answer !== null || p.answerTime === 10)) {
+        // Set answer to null for timed out players
+        players.forEach(p => {
+          if (p.answer === null) p.answerTime = 10;
+        });
+        evaluateRound(match, io);
+      }
+    }
+  }, COUNTDOWN_INTERVAL_MS);
+
+  // Store timer reference for cleanup
+  matchTimers.set(match.matchId, {
+    interval: countdownInterval,
+    currentQuestion: match.questionIndex,
+    questionStartTime: match.questionStartTime,
+  });
+}
+
+// Clean up timer when match ends
+function cleanupMatchTimer(matchId) {
+  const timerData = matchTimers.get(matchId);
+  if (timerData) {
+    clearInterval(timerData.interval);
+    matchTimers.delete(matchId);
+  }
+}
+
+// NEW: Try to instantly pair players from the waitingQueue
+function tryInstantQueuePair() {
+  if (matchmakingLock) {
+    setTimeout(tryInstantQueuePair, 50);
+    return;
+  }
+
+  matchmakingLock = true;
+  
+  try {
+    // Get connected players from waiting queue
+    const availablePlayers = [];
+    for (const [deviceId, player] of waitingQueue) {
+      // Skip if already in match
+      if (playersInMatch.has(deviceId)) {
+        waitingQueue.delete(deviceId);
+        continue;
+      }
+      
+      // Verify socket is connected
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (socket && socket.connected) {
+        availablePlayers.push(player);
+      } else {
+        // Ghost user — remove
+        waitingQueue.delete(deviceId);
+        console.log(`[waitingQueue] Removed ghost: ${player.username}`);
+      }
+    }
+    
+    console.log(`[tryInstantQueuePair] ${availablePlayers.length} players available`);
+    
+    // Pair in groups of 2
+    while (availablePlayers.length >= 2) {
+      const p1 = availablePlayers.shift();
+      const p2 = availablePlayers.shift();
+      
+      // Remove from queue ATOMICALLY
+      waitingQueue.delete(p1.deviceId);
+      waitingQueue.delete(p2.deviceId);
+      
+      // Mark as in match
+      playersInMatch.add(p1.deviceId);
+      playersInMatch.add(p2.deviceId);
+      
+      // Create match
+      const questionsPerMatch = 5;
+      const match = createMatch(
+        { deviceId: p1.deviceId, username: p1.username, socketId: p1.socketId },
+        { deviceId: p2.deviceId, username: p2.username, socketId: p2.socketId },
+        true, // Bible quiz
+        questionsPerMatch
+      );
+      match.tournamentRound = 1; // Default to round 1 for queue matches
+      
+      const basePayload = {
+        matchId: match.matchId,
+        matchSeed: match.seed,
+        questions: match.questions,
+        round: 1,
+        totalQuestions: questionsPerMatch,
+        isTournament: true,
+      };
+      
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+      
+      if (s1) {
+        s1.join(match.matchId);
+        s1.emit('match_found', {
+          ...basePayload,
+          you: { username: p1.username, deviceId: p1.deviceId },
+          opponent: { username: p2.username, deviceId: p2.deviceId },
+        });
+      }
+      if (s2) {
+        s2.join(match.matchId);
+        s2.emit('match_found', {
+          ...basePayload,
+          you: { username: p2.username, deviceId: p2.deviceId },
+          opponent: { username: p1.username, deviceId: p1.deviceId },
+        });
+      }
+      
+      // Start server-driven timer
+      startMatchTimer(match);
+      
+      console.log(`[instant-queue-pair] ${p1.username} vs ${p2.username} → ${match.matchId}`);
+      broadcastToSpectators('match_started', {
+        matchId: match.matchId,
+        p1: { username: p1.username, deviceId: p1.deviceId },
+        p2: { username: p2.username, deviceId: p2.deviceId },
+      });
+    }
+    
+    // Notify remaining players of their queue position
+    let position = 1;
+    for (const [, player] of waitingQueue) {
+      const socket = io.sockets.sockets.get(player.socketId);
+      if (socket) {
+        socket.emit('queue_update', { 
+          position, 
+          totalWaiting: waitingQueue.size,
+          message: `Position ${position} of ${waitingQueue.size}`
+        });
+      }
+      position++;
+    }
+  } finally {
+    matchmakingLock = false;
+  }
+}
+
+// Periodic ghost user cleanup (runs every 30 seconds)
+setInterval(() => {
+  let cleaned = 0;
+  
+  // Clean waitingQueue
+  for (const [deviceId, player] of waitingQueue) {
+    const socket = io.sockets.sockets.get(player.socketId);
+    if (!socket || !socket.connected) {
+      waitingQueue.delete(deviceId);
+      cleaned++;
+    }
+  }
+  
+  // Clean winnersQueue
+  for (const [deviceId, player] of winnersQueue) {
+    const socket = io.sockets.sockets.get(player.socketId);
+    if (!socket || !socket.connected) {
+      winnersQueue.delete(deviceId);
+      cleaned++;
+    }
+  }
+  
+  // Clean playersInMatch (if their match is no longer active)
+  for (const deviceId of playersInMatch) {
+    let inActiveMatch = false;
+    for (const [, match] of matches) {
+      if (match.active && match.players[deviceId]) {
+        inActiveMatch = true;
+        break;
+      }
+    }
+    if (!inActiveMatch) {
+      playersInMatch.delete(deviceId);
+      cleaned++;
+    }
+  }
+  
+  if (cleaned > 0) {
+    console.log(`[ghost-cleanup] Removed ${cleaned} stale entries`);
+  }
+}, 30000);
 
 // Declare the overall tournament champion
 async function declareTournamentChampion(player) {
@@ -645,6 +1029,11 @@ io.on('connection', (socket) => {
     spectators.delete(socket.id);
     if (deviceId) {
       lobby.delete(deviceId);
+      
+      // IMMEDIATELY remove from queues (ghost cleanup)
+      waitingQueue.delete(deviceId);
+      winnersQueue.delete(deviceId);
+      
       broadcastLobbyCount();
       
       // Broadcast updated active count during tournament registration
@@ -652,19 +1041,29 @@ io.on('connection', (socket) => {
         const activeCount = getActivePlayerCount();
         io.emit('active_count', { count: activeCount, registered: registeredPlayers.size });
       }
+      
       // Mark player as disconnected in any active match
       for (const [matchId, match] of matches) {
         if (match.players[deviceId] && match.active) {
           match.players[deviceId].connected = false;
           match.players[deviceId].disconnectedAt = Date.now();
           socket.to(matchId).emit('opponent_disconnected', { matchId });
-          // Give them 30s to reconnect before forfeiting
+          
+          // Give them 15s to reconnect before forfeiting (reduced from 30s for faster games)
           setTimeout(() => {
             const m = matches.get(matchId);
             if (m && m.active && !m.players[deviceId]?.connected) {
               // Forfeit: opponent wins
               const winner = Object.values(m.players).find(p => p.deviceId !== deviceId);
               const loser  = match.players[deviceId];
+              
+              // Clean up match timer
+              cleanupMatchTimer(matchId);
+              
+              // Remove from playersInMatch
+              playersInMatch.delete(deviceId);
+              if (winner) playersInMatch.delete(winner.deviceId);
+              
               if (winner) {
                 const winnerSocket = io.sockets.sockets.get(winner.socketId);
                 if (winnerSocket) winnerSocket.emit('match_over_forfeit', { result: 'win', reason: 'Opponent left the match.' });
@@ -673,6 +1072,20 @@ io.on('connection', (socket) => {
                 wb.wins = (wb.wins || 0) + 1;
                 leaderboard.set(winner.username, wb);
                 broadcastLeaderboard();
+                
+                // If this is a tournament match, queue winner for next round
+                if (m.tournamentRound) {
+                  const round = m.tournamentRound;
+                  const wp = registeredPlayers.get(winner.deviceId);
+                  if (wp) {
+                    wp.wins = (wp.wins || 0) + 1;
+                    wp.round = round + 1;
+                  }
+                  queueWinnerForNextRound(
+                    { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
+                    round
+                  );
+                }
               }
               if (loser) {
                 broadcastToSpectators('player_eliminated', { username: loser.username });
@@ -685,7 +1098,7 @@ io.on('connection', (socket) => {
               m.active = false;
               matches.delete(matchId);
             }
-          }, 30000);
+          }, 15000);
         }
       }
     }
@@ -723,6 +1136,60 @@ io.on('connection', (socket) => {
     devices.set(deviceId, socket.id);
   });
 
+  // ── Request current state sync (reconnection / visibility change) ──────
+  socket.on('request_state_sync', ({ deviceId }) => {
+    if (!deviceId) return;
+    
+    // Build current state for this player
+    const syncData = {
+      timestamp: Date.now(),
+    };
+    
+    // Check if in tournament registration mode
+    if (isRegistrationMode()) {
+      const player = registeredPlayers.get(deviceId);
+      if (player) {
+        syncData.stage = 'waiting';
+        syncData.waitingCount = registeredPlayers.size;
+        syncData.scheduledDate = tournamentConfig.scheduledDate;
+        syncData.tournamentStarted = false;
+      }
+    } else if (tournamentConfig.tournamentStarted) {
+      syncData.tournamentStarted = true;
+    }
+    
+    // Check if in active match
+    if (playersInMatch.has(deviceId)) {
+      for (const [matchId, match] of matches) {
+        if (match.p1?.deviceId === deviceId || match.p2?.deviceId === deviceId) {
+          const isP1 = match.p1?.deviceId === deviceId;
+          const opponent = isP1 ? match.p2 : match.p1;
+          syncData.stage = 'match';
+          syncData.matchId = matchId;
+          syncData.opponent = opponent ? { username: opponent.username, id: opponent.deviceId } : null;
+          syncData.tournament = {
+            phase: 'in_match',
+            matchId,
+            currentQuestionIndex: match.currentQuestion || 0,
+            round: match.tournamentRound || 1,
+          };
+          break;
+        }
+      }
+    }
+    
+    // Check if in winners queue (waiting for next round)
+    if (winnersQueue.has(deviceId)) {
+      syncData.stage = 'waiting';
+      syncData.tournament = {
+        phase: 'waiting_match',
+        round: winnersQueue.get(deviceId).round || currentRound,
+      };
+    }
+    
+    socket.emit('state_sync', syncData);
+  });
+
   // ── Player joins the matchmaking lobby ──────────────────────────────────
   socket.on('join_lobby', ({ deviceId, username, sessionToken, isSpecialSession }) => {
     if (isRateLimited(socket.id, 'join_lobby', 3, 10000)) {
@@ -733,6 +1200,16 @@ io.on('connection', (socket) => {
     }
     if (username.length > 30) {
       return recordViolation(socket, 'Username too long');
+    }
+
+    // GUARD: Check if player is already in an active match
+    if (playersInMatch.has(deviceId)) {
+      console.log(`[join_lobby] ${username} is already in a match — rejecting`);
+      socket.emit('already_in_match', { 
+        message: 'You are already in an active match.',
+        deviceId 
+      });
+      return;
     }
 
     socket.data.deviceId = deviceId;
@@ -929,6 +1406,53 @@ io.on('connection', (socket) => {
     }
   });
 
+  // ── NEW: Explicit queue join for tournament matchmaking ─────────────────
+  socket.on('join_queue', ({ deviceId, username }) => {
+    if (isRateLimited(socket.id, 'join_queue', 3, 5000)) {
+      return recordViolation(socket, 'Rate limit: join_queue');
+    }
+    
+    // Validate
+    if (!deviceId || !username) {
+      socket.emit('queue_error', { error: 'Missing deviceId or username' });
+      return;
+    }
+    
+    // GUARD: Can't join queue if already in match
+    if (playersInMatch.has(deviceId)) {
+      socket.emit('already_in_match', { message: 'You are already in an active match.' });
+      return;
+    }
+    
+    // GUARD: Already in queue
+    if (waitingQueue.has(deviceId) || winnersQueue.has(deviceId)) {
+      socket.emit('already_in_queue', { 
+        message: 'You are already in the matchmaking queue.',
+        queueSize: waitingQueue.size + winnersQueue.size
+      });
+      return;
+    }
+    
+    // Add to waiting queue
+    waitingQueue.set(deviceId, {
+      deviceId,
+      username,
+      socketId: socket.id,
+      round: 1,
+      queuedAt: Date.now(),
+      wins: 0,
+    });
+    
+    console.log(`[waitingQueue] ${username} joined (${waitingQueue.size} waiting)`);
+    socket.emit('queue_joined', { 
+      position: waitingQueue.size,
+      message: 'Looking for opponent...'
+    });
+    
+    // Try instant pairing
+    tryInstantQueuePair();
+  });
+
   // ── Player submits answer ───────────────────────────────────────────────
   socket.on('submit_answer', ({ matchId, deviceId, answer, timeLeft, clientTimestamp }) => {
     if (isRateLimited(socket.id, 'submit_answer', 10, 15000)) {
@@ -1077,6 +1601,10 @@ function evaluateRound(match, io) {
       p1.answer = null; p1.answerTime = null;
       p2.answer = null; p2.answerTime = null;
       
+      // Restart server timer for next question
+      cleanupMatchTimer(match.matchId);
+      startMatchTimer(match);
+      
       // Send the next question to both players
       const nextQuestion = match.questions[match.questionIndex];
       const nextQuestionPayload = {
@@ -1163,7 +1691,15 @@ function evaluateRound(match, io) {
   });
 
   match.active = false;
-  setTimeout(() => matches.delete(match.matchId), 120000); // clean up after 2min
+  
+  // Clean up match timer
+  cleanupMatchTimer(match.matchId);
+  
+  // IMMEDIATELY remove players from playersInMatch (allows re-queueing)
+  playersInMatch.delete(p1.deviceId);
+  playersInMatch.delete(p2.deviceId);
+  
+  setTimeout(() => matches.delete(match.matchId), 30000); // clean up after 30s (reduced from 2min)
 
   // ── Tournament elimination bracket logic ────────────────────────────
   if (match.tournamentRound) {
@@ -1173,6 +1709,11 @@ function evaluateRound(match, io) {
     if (loser) {
       const lp = registeredPlayers.get(loser.deviceId);
       if (lp) lp.status = 'eliminated';
+      
+      // Remove from any queues
+      waitingQueue.delete(loser.deviceId);
+      winnersQueue.delete(loser.deviceId);
+      
       TournamentPlayer.findOneAndUpdate(
         { deviceId: loser.deviceId, tournamentId: tournamentConfig.scheduledDate },
         { status: 'eliminated' }
@@ -1210,14 +1751,22 @@ function evaluateRound(match, io) {
         });
       }
 
+      // Queue winner for next round - this will trigger instant pairing if another winner is available
       queueWinnerForNextRound(
         { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
         round
       );
     } else {
-      // Both wrong — both eliminated, check if round is now complete
+      // Both wrong — both eliminated
+      waitingQueue.delete(p1.deviceId);
+      waitingQueue.delete(p2.deviceId);
+      winnersQueue.delete(p1.deviceId);
+      winnersQueue.delete(p2.deviceId);
+      
+      // Check if round is now complete
       const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
       const waitingWinners = bracketWinners.get(round) || [];
+      
       if (activeRoundMatches.length === 0) {
         if (waitingWinners.length >= 2) advanceToNextRound(round);
         else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
@@ -1427,6 +1976,65 @@ app.get('/admin/special-session', (_, res) => res.json(specialSession));
 // ─── Leaderboard REST endpoint ────────────────────────────────────────────────
 app.get('/leaderboard', (_, res) => res.json(getLeaderboardArray()));
 
+// ─── Debug/Diagnostic endpoint ────────────────────────────────────────────────
+// Returns current state of all queues and matches for debugging
+app.get('/debug/state', (_, res) => {
+  const activeMatches = [...matches.values()].filter(m => m.active);
+  
+  res.json({
+    timestamp: new Date().toISOString(),
+    queues: {
+      waitingQueue: {
+        size: waitingQueue.size,
+        players: [...waitingQueue.values()].map(p => ({
+          username: p.username,
+          deviceId: p.deviceId.slice(0, 8) + '...',
+          queuedAt: new Date(p.queuedAt).toISOString(),
+          round: p.round,
+        })),
+      },
+      winnersQueue: {
+        size: winnersQueue.size,
+        players: [...winnersQueue.values()].map(p => ({
+          username: p.username,
+          deviceId: p.deviceId.slice(0, 8) + '...',
+          round: p.round,
+          wins: p.wins,
+        })),
+      },
+    },
+    matches: {
+      total: matches.size,
+      active: activeMatches.length,
+      activeList: activeMatches.map(m => ({
+        matchId: m.matchId,
+        round: m.tournamentRound,
+        questionIndex: m.questionIndex,
+        players: Object.values(m.players).map(p => ({
+          username: p.username,
+          answered: p.answer !== null,
+          connected: p.connected,
+        })),
+      })),
+    },
+    playersInMatch: playersInMatch.size,
+    bracketWinners: [...bracketWinners.entries()].map(([round, players]) => ({
+      round,
+      count: players.length,
+      players: players.map(p => p.username),
+    })),
+    matchTimers: matchTimers.size,
+    tournament: {
+      scheduledDate: tournamentConfig.scheduledDate,
+      started: tournamentConfig.tournamentStarted,
+      registeredCount: registeredPlayers.size,
+      activeCount: getActivePlayerCount(),
+      currentRound,
+    },
+    lobby: lobby.size,
+  });
+});
+
 // ─── Bible Questions endpoint (for tournament) ───────────────────────────────
 // Returns the full Bible questions bank for the tournament
 app.get('/api/bible-questions', (_, res) => {
@@ -1617,6 +2225,17 @@ app.post('/admin/tournament/reset', (req, res) => {
   tournamentConfig.tournamentStarted = false;
   lobby.clear();
   
+  // Clear new queues
+  waitingQueue.clear();
+  winnersQueue.clear();
+  playersInMatch.clear();
+  bracketWinners.clear();
+  
+  // Clear all match timers
+  for (const [matchId] of matchTimers) {
+    cleanupMatchTimer(matchId);
+  }
+  
   io.emit('tournament_reset', { message: 'Tournament has been reset' });
   console.log('[tournament] Reset — back to normal mode');
   res.json({ ok: true });
@@ -1632,6 +2251,17 @@ app.post('/admin/reset-all', (req, res) => {
   // Clear matches & lobby
   lobby.clear();
   matches.clear();
+  
+  // Clear new queues
+  waitingQueue.clear();
+  winnersQueue.clear();
+  playersInMatch.clear();
+  bracketWinners.clear();
+  
+  // Clear all match timers
+  for (const [matchId] of matchTimers) {
+    cleanupMatchTimer(matchId);
+  }
   
   // Clear leaderboard
   leaderboard.clear();

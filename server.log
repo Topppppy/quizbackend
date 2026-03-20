@@ -1,0 +1,7 @@
+[dotenv@17.3.1] injecting env (3) from .env -- tip: ⚙️  override existing env vars with { override: true }
+✅ Connected to MongoDB
+✅ Loaded tournament schedule from DB: 2026-03-20T17:00:00.000Z
+[tournament] Auto-start scheduled in 21517s (2026-03-20T17:00:00.000Z)
+
+🚀 QuizDuel server listening on http://localhost:4000
+
