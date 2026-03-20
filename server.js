@@ -11,6 +11,7 @@ const { BIBLE_QUESTIONS } = require('./bibleQuestions');
 const User              = require('./models/User');
 const TournamentPlayer  = require('./models/TournamentPlayer');
 const TournamentSchedule = require('./models/TournamentSchedule');
+const { log } = require('console');
 
 // ─── Hardcoded admin credentials ─────────────────────────────────────────────
 const ADMIN_EMAIL    = 'indtropical@gmail.com';
@@ -401,10 +402,13 @@ function tryPairWinners(completedRound) {
     // Check if only 1 winner remains and no active matches
     if (availableWinners.length === 1) {
       const activeMatches = [...matches.values()].filter(m => m.tournamentRound && m.active);
+      
       if (activeMatches.length === 0) {
         // This is the champion!
         const champion = availableWinners[0];
         winnersQueue.delete(champion.deviceId);
+        const initialPlayerCount = tournamentConfig.initialPlayerCount || registeredPlayers.size;
+        console.log(`[tryPairWinners] Declaring champion: ${champion.username} (completed round ${completedRound}, initial players: ${initialPlayerCount})`);
         declareTournamentChampion(champion);
       } else {
         // Wait for other matches to complete
@@ -676,6 +680,9 @@ function startTournament() {
   const connectedPlayers = allPlayers.filter(p => {
     if (!p.socketId) return false;
     const socket = io.sockets.sockets.get(p.socketId);
+    console.log(socket, "The users socket id");
+    console.log(socket.connected, "The users socket id connected");
+    
     return socket && socket.connected;
   });
 
@@ -687,6 +694,9 @@ function startTournament() {
   }
 
   const players = connectedPlayers;
+  
+  // IMPORTANT: Track initial player count for bye/champion logic
+  tournamentConfig.initialPlayerCount = players.length;
   
   // Calculate questions per match based on player count
   const questionsPerMatch = getQuestionsPerMatch(connectedPlayers.length);
@@ -1095,48 +1105,82 @@ io.on('connection', (socket) => {
           setTimeout(() => {
             const m = matches.get(matchId);
             if (m && m.active && !m.players[deviceId]?.connected) {
-              // Forfeit: opponent wins
-              const winner = Object.values(m.players).find(p => p.deviceId !== deviceId);
-              const loser  = match.players[deviceId];
+              // Check if opponent is still connected before declaring them winner
+              const opponent = Object.values(m.players).find(p => p.deviceId !== deviceId);
+              const opponentSocket = opponent ? io.sockets.sockets.get(opponent.socketId) : null;
+              const opponentConnected = opponentSocket && opponentSocket.connected;
               
               // Clean up match timer
               cleanupMatchTimer(matchId);
               
-              // Remove from playersInMatch
+              // Remove disconnected player from playersInMatch
               playersInMatch.delete(deviceId);
-              if (winner) playersInMatch.delete(winner.deviceId);
               
-              if (winner) {
-                const winnerSocket = io.sockets.sockets.get(winner.socketId);
-                if (winnerSocket) winnerSocket.emit('match_over_forfeit', { result: 'win', reason: 'Opponent left the match.' });
+              if (opponent && opponentConnected) {
+                // Opponent is still connected — they win by forfeit
+                playersInMatch.delete(opponent.deviceId);
+                
+                opponentSocket.emit('match_over_forfeit', { result: 'win', reason: 'Opponent left the match.' });
+                
                 // Update leaderboard
-                const wb = leaderboard.get(winner.username) || { username: winner.username, wins: 0 };
+                const wb = leaderboard.get(opponent.username) || { username: opponent.username, wins: 0 };
                 wb.wins = (wb.wins || 0) + 1;
-                leaderboard.set(winner.username, wb);
+                leaderboard.set(opponent.username, wb);
                 broadcastLeaderboard();
                 
                 // If this is a tournament match, queue winner for next round
                 if (m.tournamentRound) {
                   const round = m.tournamentRound;
-                  const wp = registeredPlayers.get(winner.deviceId);
+                  const wp = registeredPlayers.get(opponent.deviceId);
                   if (wp) {
                     wp.wins = (wp.wins || 0) + 1;
                     wp.round = round + 1;
                   }
                   queueWinnerForNextRound(
-                    { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
+                    { deviceId: opponent.deviceId, username: opponent.username, socketId: opponent.socketId, wins: (wp?.wins || 1) },
                     round
                   );
                 }
-              }
-              if (loser) {
-                broadcastToSpectators('player_eliminated', { username: loser.username });
+                
+                broadcastToSpectators('player_eliminated', { username: m.players[deviceId].username });
                 broadcastToSpectators('match_ended', {
                   matchId,
-                  winner: winner?.username,
-                  loser: loser.username,
+                  winner: opponent.username,
+                  loser: m.players[deviceId].username,
                 });
+              } else {
+                // Both players disconnected — treat as both eliminated
+                console.log(`[forfeit] Both players disconnected in match ${matchId} — no winner`);
+                playersInMatch.delete(opponent?.deviceId);
+                
+                // If tournament match, check if bye player should advance
+                if (m.tournamentRound) {
+                  const round = m.tournamentRound;
+                  broadcastToSpectators('match_ended', {
+                    matchId,
+                    winner: null,
+                    reason: 'Both players disconnected',
+                  });
+                  
+                  // Check if round is complete and if there's a bye player waiting
+                  const activeRoundMatches = [...matches.values()].filter(ma => ma.matchId !== matchId && ma.tournamentRound === round && ma.active);
+                  const waitingWinners = bracketWinners.get(round) || [];
+                  
+                  console.log(`[forfeit] Round ${round}: ${activeRoundMatches.length} other matches active, ${waitingWinners.length} winners waiting`);
+                  
+                  if (activeRoundMatches.length === 0) {
+                    if (waitingWinners.length >= 2) {
+                      advanceToNextRound(round);
+                    } else if (waitingWinners.length === 1) {
+                      // The bye player wins!
+                      declareTournamentChampion(waitingWinners[0]);
+                    } else {
+                      io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion.' });
+                    }
+                  }
+                }
               }
+              
               m.active = false;
               matches.delete(matchId);
             }
