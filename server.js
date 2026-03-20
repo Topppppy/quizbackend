@@ -478,19 +478,16 @@ function startMatchTimer(match) {
       let needsEval = false;
       
       for (const player of players) {
-        if (player.answer === null && match.active) {
-          player.answer = null; // explicit timeout
+        if (player.answerTime === null && match.active) {
+          // Player didn't answer in time — mark as timed out
+          player.answer = null;
           player.answerTime = TOURNAMENT_PACING.QUESTION_TIME_SECONDS;
           needsEval = true;
         }
       }
 
-      // Evaluate if both have now answered (either by submission or timeout)
-      if (needsEval && players.every(p => p.answer !== null || p.answerTime === 10)) {
-        // Set answer to null for timed out players
-        players.forEach(p => {
-          if (p.answer === null) p.answerTime = 10;
-        });
+      // Evaluate if all players have been resolved (submitted or timed out)
+      if (needsEval && match.active && players.every(p => p.answerTime !== null)) {
         evaluateRound(match, io);
       }
     }
@@ -1782,7 +1779,7 @@ io.on('connection', (socket) => {
     }
 
     player.answer    = answer;
-    player.answerTime = Math.max(0, 9 - (timeLeft || 0));
+    player.answerTime = Math.max(0, TOURNAMENT_PACING.QUESTION_TIME_SECONDS - (timeLeft || 0));
 
     socket.to(matchId).emit('opponent_answered');
 
@@ -1798,7 +1795,7 @@ io.on('connection', (socket) => {
     const player = match.players[deviceId];
     if (!player || player.answer !== null) return;
     player.answer = null;
-    player.answerTime = 9;
+    player.answerTime = TOURNAMENT_PACING.QUESTION_TIME_SECONDS;
 
     const playerList = Object.values(match.players);
     if (playerList.every(p => p.answer !== null)) evaluateRound(match, io);
@@ -2003,33 +2000,24 @@ function evaluateRound(match, io) {
   
   setTimeout(() => matches.delete(match.matchId), 30000); // clean up after 30s (reduced from 2min)
 
-  // ── Tournament elimination bracket logic ────────────────────────────
+  // ── Tournament elimination bracket logic ──────────────────────────────
+  // Data updates happen immediately; socket emissions are delayed so players see answer feedback
   if (match.tournamentRound) {
+    const RESULT_DISPLAY_MS = 2000; // 2s for players to see correct/incorrect answer highlight
     const round = match.tournamentRound;
 
-    // Evict loser from tournament
+    // Update data immediately (so admin API shows correct stats)
     if (loser) {
       const lp = registeredPlayers.get(loser.deviceId);
       if (lp) lp.status = 'eliminated';
-      
-      // Remove from any queues
       waitingQueue.delete(loser.deviceId);
       winnersQueue.delete(loser.deviceId);
-      
       TournamentPlayer.findOneAndUpdate(
         { deviceId: loser.deviceId, tournamentId: tournamentConfig.scheduledDate },
         { status: 'eliminated' }
       ).catch(e => console.error('[bracket] DB evict error:', e.message));
-
-      const loserSocket = io.sockets.sockets.get(loser.socketId);
-      if (loserSocket) loserSocket.emit('tournament_eliminated', {
-        message: 'You have been eliminated from the tournament.',
-        round,
-      });
-      console.log(`[tournament R${round}] Eliminated: ${loser.username}`);
     }
 
-    // Queue winner for the next round (both-wrong = no one advances, both eliminated)
     if (winner) {
       const wp = registeredPlayers.get(winner.deviceId);
       if (wp) {
@@ -2041,62 +2029,73 @@ function evaluateRound(match, io) {
         { deviceId: winner.deviceId, tournamentId: tournamentConfig.scheduledDate },
         { $inc: { wins: 1 }, round: round + 1 }
       ).catch(e => console.error('[bracket] DB winner update error:', e.message));
-
-      // Notify winner they advance
-      const winnerSocket = io.sockets.sockets.get(winner.socketId);
-      if (winnerSocket) {
-        winnerSocket.emit('tournament_round_won', {
-          message: `You won Round ${round}! Waiting for next round...`,
-          round,
-          nextRound: round + 1,
-          wins: wp?.wins || 1,
-        });
-      }
-
-      // Queue winner for next round - this will trigger instant pairing if another winner is available
-      queueWinnerForNextRound(
-        { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
-        round
-      );
     } else {
-      // Both wrong — both eliminated
-      console.log(`[tournament R${round}] Both wrong — eliminating ${p1.username} and ${p2.username}`);
-      
-      // Mark both as eliminated in registeredPlayers
+      // Both wrong — update data immediately
       const lp1 = registeredPlayers.get(p1.deviceId);
       const lp2 = registeredPlayers.get(p2.deviceId);
       if (lp1) lp1.status = 'eliminated';
       if (lp2) lp2.status = 'eliminated';
-      
       waitingQueue.delete(p1.deviceId);
       waitingQueue.delete(p2.deviceId);
       winnersQueue.delete(p1.deviceId);
       winnersQueue.delete(p2.deviceId);
-      
-      // Send tournament_eliminated to BOTH players
-      const s1 = io.sockets.sockets.get(p1.socketId);
-      const s2 = io.sockets.sockets.get(p2.socketId);
-      if (s1) s1.emit('tournament_eliminated', {
-        message: 'Both players answered incorrectly. You have been eliminated.',
-        round,
-      });
-      if (s2) s2.emit('tournament_eliminated', {
-        message: 'Both players answered incorrectly. You have been eliminated.',
-        round,
-      });
-      
-      // Check if round is now complete
-      const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
-      const waitingWinners = bracketWinners.get(round) || [];
-      
-      if (activeRoundMatches.length === 0) {
-        if (waitingWinners.length >= 2) advanceToNextRound(round);
-        else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
-        else {
-          io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion this round.' });
+    }
+
+    // Delay socket emissions so players see the answer highlight for 2s
+    setTimeout(() => {
+      if (loser) {
+        const loserSocket = io.sockets.sockets.get(loser.socketId);
+        if (loserSocket) loserSocket.emit('tournament_eliminated', {
+          message: 'You have been eliminated from the tournament.',
+          round,
+        });
+        console.log(`[tournament R${round}] Eliminated: ${loser.username}`);
+      }
+
+      if (winner) {
+        const wp = registeredPlayers.get(winner.deviceId);
+        const winnerSocket = io.sockets.sockets.get(winner.socketId);
+        if (winnerSocket) {
+          winnerSocket.emit('tournament_round_won', {
+            message: `You won Round ${round}! Waiting for next round...`,
+            round,
+            nextRound: round + 1,
+            wins: wp?.wins || 1,
+          });
+        }
+
+        // Queue winner for next round (triggers pairing after POST_MATCH_DELAY)
+        queueWinnerForNextRound(
+          { deviceId: winner.deviceId, username: winner.username, socketId: winner.socketId, wins: (wp?.wins || 1) },
+          round
+        );
+      } else {
+        // Both wrong — notify both players
+        console.log(`[tournament R${round}] Both wrong — eliminating ${p1.username} and ${p2.username}`);
+        const s1 = io.sockets.sockets.get(p1.socketId);
+        const s2 = io.sockets.sockets.get(p2.socketId);
+        if (s1) s1.emit('tournament_eliminated', {
+          message: 'Both players answered incorrectly. You have been eliminated.',
+          round,
+        });
+        if (s2) s2.emit('tournament_eliminated', {
+          message: 'Both players answered incorrectly. You have been eliminated.',
+          round,
+        });
+
+        // Check if round is now complete
+        const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
+        const waitingWinners = bracketWinners.get(round) || [];
+
+        if (activeRoundMatches.length === 0) {
+          if (waitingWinners.length >= 2) advanceToNextRound(round);
+          else if (waitingWinners.length === 1) declareTournamentChampion(waitingWinners[0]);
+          else {
+            io.emit('tournament_no_winner', { round, message: 'All players eliminated — no champion this round.' });
+          }
         }
       }
-    }
+    }, RESULT_DISPLAY_MS);
   }
 }
 
