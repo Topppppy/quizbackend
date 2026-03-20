@@ -1995,10 +1995,30 @@ function evaluateRound(match, io) {
       );
     } else {
       // Both wrong — both eliminated
+      console.log(`[tournament R${round}] Both wrong — eliminating ${p1.username} and ${p2.username}`);
+      
+      // Mark both as eliminated in registeredPlayers
+      const lp1 = registeredPlayers.get(p1.deviceId);
+      const lp2 = registeredPlayers.get(p2.deviceId);
+      if (lp1) lp1.status = 'eliminated';
+      if (lp2) lp2.status = 'eliminated';
+      
       waitingQueue.delete(p1.deviceId);
       waitingQueue.delete(p2.deviceId);
       winnersQueue.delete(p1.deviceId);
       winnersQueue.delete(p2.deviceId);
+      
+      // Send tournament_eliminated to BOTH players
+      const s1 = io.sockets.sockets.get(p1.socketId);
+      const s2 = io.sockets.sockets.get(p2.socketId);
+      if (s1) s1.emit('tournament_eliminated', {
+        message: 'Both players answered incorrectly. You have been eliminated.',
+        round,
+      });
+      if (s2) s2.emit('tournament_eliminated', {
+        message: 'Both players answered incorrectly. You have been eliminated.',
+        round,
+      });
       
       // Check if round is now complete
       const activeRoundMatches = [...matches.values()].filter(m => m.tournamentRound === round && m.active);
