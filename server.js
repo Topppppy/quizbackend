@@ -646,6 +646,13 @@ setInterval(() => {
 // Declare the overall tournament champion
 async function declareTournamentChampion(player) {
   console.log(`[tournament] 🏆 CHAMPION: ${player.username}`);
+  
+  // Mark champion status in registeredPlayers for guard checks
+  const registered = registeredPlayers.get(player.deviceId);
+  if (registered) {
+    registered.status = 'champion';
+  }
+  
   io.emit('tournament_champion', { username: player.username, deviceId: player.deviceId });
   broadcastToSpectators('tournament_champion', { username: player.username });
 
@@ -1368,6 +1375,55 @@ io.on('connection', (socket) => {
         message: 'You are already in an active match.',
         deviceId 
       });
+      return;
+    }
+    
+    // GUARD: If tournament is ACTIVE (started), don't allow new lobby joins
+    // Instead, check if they're eliminated or if there's a champion
+    if (tournamentConfig.tournamentStarted) {
+      const registered = registeredPlayers.get(deviceId);
+      
+      // Check if there's already a champion (tournament over)
+      const champion = [...registeredPlayers.values()].find(p => p.status === 'champion');
+      if (champion) {
+        socket.emit('tournament_ended_info', {
+          message: 'Tournament has ended!',
+          championUsername: champion.username,
+        });
+        console.log(`[join_lobby] ${username} tried to join but tournament ended (champion: ${champion.username})`);
+        return;
+      }
+      
+      // If registered and eliminated, tell them
+      if (registered && registered.status === 'eliminated') {
+        socket.emit('tournament_eliminated', {
+          message: 'You have been eliminated from this tournament.',
+          round: registered.round || 1,
+        });
+        console.log(`[join_lobby] ${username} tried to rejoin but was eliminated`);
+        return;
+      }
+      
+      // If registered and in waiting/active status, update their socket
+      if (registered) {
+        registered.socketId = socket.id;
+        console.log(`[join_lobby] ${username} reconnected during active tournament`);
+        
+        // Check if they're in winnersQueue waiting for next match
+        if (winnersQueue.has(deviceId)) {
+          socket.emit('tournament_round_won', {
+            message: 'Waiting for your next opponent...',
+            round: registered.round,
+          });
+        }
+        return;
+      }
+      
+      // Not registered and tournament started — can't join
+      socket.emit('tournament_in_progress', {
+        message: 'Tournament is already in progress. Please wait for the next one.',
+      });
+      console.log(`[join_lobby] ${username} tried to join active tournament — rejected`);
       return;
     }
 
