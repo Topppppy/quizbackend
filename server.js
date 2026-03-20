@@ -83,10 +83,10 @@ const matchTimers = new Map();
 // ─── Tournament Pacing Settings ──────────────────────────────────────────────
 // Adjust these to control how fast the tournament runs
 const TOURNAMENT_PACING = {
-  QUESTION_TIME_SECONDS: 10,       // Seconds per question (10 = fast, 15-20 = relaxed)
+  QUESTION_TIME_SECONDS: 15,       // Seconds per question (10 = fast, 15-20 = relaxed)
   PRE_MATCH_COUNTDOWN: 5,          // Seconds countdown before match starts
   BETWEEN_ROUNDS_DELAY: 3,         // Seconds delay after round result before next question
-  POST_MATCH_DELAY: 3,             // Seconds before winners get paired for next match
+  POST_MATCH_DELAY: 5,             // Seconds before winners get paired for next match
 };
 
 // ─── Tournament Registration System ──────────────────────────────────────────
@@ -205,6 +205,7 @@ function pairPlayersForRound(players, round, questionsPerMatch = 5) {
       totalQuestions: match.questions?.length || questionsPerMatch,
       isTournament: true,
       preMatchCountdown: TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN, // Tell clients to show countdown
+      questionTime: TOURNAMENT_PACING.QUESTION_TIME_SECONDS,
     };
 
     if (s1) { 
@@ -271,8 +272,12 @@ function queueWinnerForNextRound(player, round) {
   const waitingWinners = bracketWinners.get(round);
   console.log(`[bracket R${round}] ${player.username} queued (${waitingWinners.length} waiting)`);
 
-  // TRY INSTANT WINNER PAIRING: if we have 2+ winners, pair them immediately
-  tryPairWinners(round);
+  // Pair winners after POST_MATCH_DELAY so players have time to see the "round won" screen
+  const delayMs = TOURNAMENT_PACING.POST_MATCH_DELAY * 1000;
+  console.log(`[bracket R${round}] Will attempt pairing in ${TOURNAMENT_PACING.POST_MATCH_DELAY}s`);
+  setTimeout(() => {
+    tryPairWinners(round);
+  }, delayMs);
 }
 
 // Advance all waiting winners into the next round
@@ -387,6 +392,7 @@ function tryPairWinners(completedRound) {
         totalQuestions: match.questions?.length || questionsPerMatch,
         isTournament: true,
         preMatchCountdown: TOURNAMENT_PACING.PRE_MATCH_COUNTDOWN,
+        questionTime: TOURNAMENT_PACING.QUESTION_TIME_SECONDS,
       };
 
       const s1 = io.sockets.sockets.get(p1.socketId);
@@ -569,6 +575,7 @@ function tryInstantQueuePair() {
         round: 1,
         totalQuestions: questionsPerMatch,
         isTournament: true,
+        questionTime: TOURNAMENT_PACING.QUESTION_TIME_SECONDS,
       };
       
       const s1 = io.sockets.sockets.get(p1.socketId);
