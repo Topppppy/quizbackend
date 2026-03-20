@@ -668,10 +668,23 @@ setInterval(() => {
 
 // Declare the overall tournament champion
 async function declareTournamentChampion(player) {
-  console.log(`[tournament] 🏆 CHAMPION: ${player.username}`);
+  // Guard: don't declare a player champion if they never actually won a match
+  // (e.g. bye player who advanced because all opponents got both-wrong)
+  const registered = registeredPlayers.get(player.deviceId);
+  const actualWins = registered?.wins || player.wins || 0;
+  
+  if (actualWins === 0) {
+    console.log(`[tournament] ⚠️ ${player.username} would be champion but has 0 wins (bye only) — no champion declared`);
+    io.emit('tournament_no_winner', { 
+      round: currentRound, 
+      message: 'All competing players were eliminated — no champion this tournament.' 
+    });
+    return;
+  }
+
+  console.log(`[tournament] 🏆 CHAMPION: ${player.username} (${actualWins} wins)`);
   
   // Mark champion status in registeredPlayers for guard checks
-  const registered = registeredPlayers.get(player.deviceId);
   if (registered) {
     registered.status = 'champion';
   }
